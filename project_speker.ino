@@ -90,8 +90,8 @@ void audio_data_callback(const uint8_t *data, uint32_t len) // BT data on 8bit f
     int16_t right = (data[i * 4 + 3] << 8) | data[i * 4 + 2]; // Right channel
 
     // Store the converted data in the i2s_data buffer
-    i2s_data[i * 2] = right; 
-    i2s_data[i * 2 + 1] = left;
+    i2s_data[i * 2] = left; 
+    i2s_data[i * 2 + 1] = right;
   }
   size_t i2s_bytes_written;
   i2s_write(I2S_NUM_0, i2s_data, sizeof(i2s_data), &i2s_bytes_written, portMAX_DELAY); // sent to DAC
