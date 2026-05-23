@@ -51,6 +51,8 @@ float w_hpf1[2] = {0}, w_hpf2[2] = {0};
 float gain_woofer = 1.0f;
 float gain_tweeter = 1.0f;
 
+bool mono = true; // true = mono mix, false = stereo passthrough (LPF ke L, HPF ke R)
+
 // Fungsi hitung ulang koefisien (dipanggil saat freq berubah)
 void update_crossover(float freq_hz) {
     // ESP-DSP pakai normalized frequency: f / fs, range 0.0 - 0.5
@@ -133,7 +135,7 @@ static float buf_mono[1024];
 static float buf_lpf[1024];
 static float buf_hpf[1024];
 
-void audio_data_callback(const uint8_t *data, uint32_t len)
+void audio_data_callback_dsp(const uint8_t *data, uint32_t len)
 {
   size_t num_samples = len / 4;
   int16_t i2s_data[num_samples * 2];
@@ -166,10 +168,33 @@ void audio_data_callback(const uint8_t *data, uint32_t len)
   i2s_write(I2S_NUM_0, i2s_data, sizeof(int16_t) * num_samples * 2, &i2s_bytes_written, portMAX_DELAY);
 }
 
+// change 8bit format to 16bit format, easier to process later
+void audio_data_callback(const uint8_t *data, uint32_t len) // BT data on 8bit format
+{
+  // Serial.printf("Audio diterima: %d bytes\n", len);
+
+  size_t num_samples = len / 4;      // LLSB, LMSB, RLSB, RMSB, so divide by 4 per point
+  int16_t i2s_data[num_samples * 2]; // Create a temporary buffer for 16-bit stereo samples
+
+  for (size_t i = 0; i < num_samples; i++)
+  {
+    // Convert each stereo sample from uint8_t to int16_t
+    int16_t left = (data[i * 4 + 1] << 8) | data[i * 4];      // Left channel
+    int16_t right = (data[i * 4 + 3] << 8) | data[i * 4 + 2]; // Right channel
+
+    // Store the converted data in the i2s_data buffer
+    i2s_data[i * 2] = right; 
+    i2s_data[i * 2 + 1] = left;
+  }
+  size_t i2s_bytes_written;
+  i2s_write(I2S_NUM_0, i2s_data, sizeof(i2s_data), &i2s_bytes_written, portMAX_DELAY); // sent to DAC
+}
+
 // Fungsi simpan & load settings
 void save_settings()
 {
   prefs.begin("speaker", false); // namespace "speaker", mode read-write
+  prefs.putFloat("mono", mono);
   prefs.putFloat("freq", crossover_freq);
   prefs.putFloat("gain_w", gain_woofer);
   prefs.putFloat("gain_t", gain_tweeter);
@@ -181,6 +206,7 @@ void save_settings()
 void load_settings()
 {
   prefs.begin("speaker", true);                     // mode read-only
+  mono = prefs.getFloat("mono", true);              // default true
   crossover_freq = prefs.getFloat("freq", 5000.0f); // default 5000 Hz
   gain_woofer = prefs.getFloat("gain_w", 1.0f);     // default 1.0
   gain_tweeter = prefs.getFloat("gain_t", 1.0f);    // default 1.0
@@ -199,7 +225,25 @@ void handle_serial()
   String cmd = Serial.readStringUntil('\n');
   cmd.trim();
 
-  if (cmd.startsWith("freq:"))
+  if (cmd.startsWith("mono:"))
+  {
+    String val = cmd.substring(5);
+    if (val == "on")
+    {
+      mono = true;
+      Serial.println("Mono mix diaktifkan");
+    }
+    else if (val == "off")
+    {
+      mono = false;
+      Serial.println("Mono mix dinonaktifkan (stereo passthrough)");
+    }
+    else
+    {
+      Serial.println("Nilai tidak valid. Gunakan 'mono:on' atau 'mono:off'");
+    }
+  }
+  else if (cmd.startsWith("freq:"))
   {
     float freq = cmd.substring(5).toFloat();
     if (freq > 100 && freq < 20000)
@@ -242,6 +286,7 @@ void handle_serial()
   else if (cmd == "reset")
   {
     // Reset ke default
+    mono = true;
     crossover_freq = 5000.0f;
     gain_woofer = 1.0f;
     gain_tweeter = 1.0f;
@@ -256,6 +301,7 @@ void handle_serial()
   }
   else if (cmd == "status")
   {
+    Serial.printf("Mono Mix    : %s\n", mono ? "on" : "off");
     Serial.printf("Crossover   : %.0f Hz\n", crossover_freq);
     Serial.printf("Gain Woofer : %.2f\n", gain_woofer);
     Serial.printf("Gain Tweeter: %.2f\n", gain_tweeter);
@@ -265,6 +311,7 @@ void handle_serial()
   else if (cmd == "help")
   {
     Serial.println("=== Serial Controller ===");
+    Serial.println("mono:<val>    → mono mix (contoh: on/off)");
     Serial.println("freq:<Hz>     → ubah crossover (100-20000)");
     Serial.println("gain_w:<val>  → gain woofer  (contoh: 1.2)");
     Serial.println("gain_t:<val>  → gain tweeter (contoh: 0.8)");
@@ -305,7 +352,14 @@ void setup()
   i2s_set_pin(I2S_NUM_0, &pin_config);
 
   a2dp_sink.set_on_connection_state_changed(bt_connection_state_changed);
-  a2dp_sink.set_stream_reader(audio_data_callback, false);
+  if (mono)
+  {
+    a2dp_sink.set_stream_reader(audio_data_callback_dsp, false);
+  }
+  else
+  {
+    a2dp_sink.set_stream_reader(audio_data_callback, false);
+  }
   a2dp_sink.set_auto_reconnect(true);
   a2dp_sink.start("Speaker Mahal 😁");
 
