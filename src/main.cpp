@@ -300,16 +300,18 @@ void handle_serial()
   }
   else if (cmd == "status")
   {
+    Serial.println("================= Status =================");
     Serial.printf("Mono Mix    : %s\n", mono_mode ? "on" : "off");
     Serial.printf("Crossover   : %.0f Hz\n", crossover_freq);
     Serial.printf("Gain Woofer : %.2f\n", gain_woofer);
     Serial.printf("Gain Tweeter: %.2f\n", gain_tweeter);
     Serial.printf("WAV Volume  : %.2f\n", wav_volume);
     Serial.printf("BT Connected: %s\n", a2dp_sink.is_connected() ? "Ya" : "Tidak");
+    Serial.println("==========================================");
   }
   else if (cmd == "help")
   {
-    Serial.println("=== Serial Controller ===");
+    Serial.println("=========== Serial Controller ===========");
     Serial.println("mono:<val>    → mono mix (contoh: on/off)");
     Serial.println("freq:<Hz>     → ubah crossover (100-20000)");
     Serial.println("gain_w:<val>  → gain woofer  (contoh: 1.2)");
@@ -319,6 +321,7 @@ void handle_serial()
     Serial.println("save          → simpan setting saat ini");
     Serial.println("reset         → kembali ke setting default");
     Serial.println("help          → tampilkan perintah ini");
+    Serial.println("==========================================");
   }
   else
   {
