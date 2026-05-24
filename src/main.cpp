@@ -51,6 +51,8 @@ float w_hpf1[2] = {0}, w_hpf2[2] = {0};
 float gain_woofer = 1.0f;
 float gain_tweeter = 1.0f;
 
+bool mono_mode = true; // true = mono mix, false = stereo passthrough (LPF ke L, HPF ke R)
+
 // Fungsi hitung ulang koefisien (dipanggil saat freq berubah)
 void update_crossover(float freq_hz) {
     // ESP-DSP pakai normalized frequency: f / fs, range 0.0 - 0.5
@@ -133,43 +135,65 @@ static float buf_mono[1024];
 static float buf_lpf[1024];
 static float buf_hpf[1024];
 
-void audio_data_callback(const uint8_t *data, uint32_t len)
+// change 8bit format to 16bit format, easier to process later
+void audio_data_callback(const uint8_t *data, uint32_t len) // BT data on 8bit format
 {
-  size_t num_samples = len / 4;
-  int16_t i2s_data[num_samples * 2];
+  if (mono_mode) {
+    // DSP crossover
+    size_t num_samples = len / 4;
+    int16_t i2s_data[num_samples * 2];
 
-  for (size_t i = 0; i < num_samples; i++)
-  {
-    int16_t left = (data[i * 4 + 1] << 8) | data[i * 4];
-    int16_t right = (data[i * 4 + 3] << 8) | data[i * 4 + 2];
+    for (size_t i = 0; i < num_samples; i++)
+    {
+      int16_t left = (data[i * 4 + 1] << 8) | data[i * 4];
+      int16_t right = (data[i * 4 + 3] << 8) | data[i * 4 + 2];
 
-    // Mono mix
-    buf_mono[i] = (float)(left + right) / 2.0f;
+      // Mono mix
+      buf_mono[i] = (float)(left + right) / 2.0f;
+    }
+
+    // LPF cascade 2x → Woofer (Linkwitz-Riley 24dB/oct)
+    dsps_biquad_f32(buf_mono, buf_lpf, num_samples, coeffs_lpf1, w_lpf1);
+    dsps_biquad_f32(buf_lpf,  buf_lpf, num_samples, coeffs_lpf2, w_lpf2);
+
+    // HPF cascade 2x → Tweeter (Linkwitz-Riley 24dB/oct)
+    dsps_biquad_f32(buf_mono, buf_hpf, num_samples, coeffs_hpf1, w_hpf1);
+    dsps_biquad_f32(buf_hpf,  buf_hpf, num_samples, coeffs_hpf2, w_hpf2);
+
+    // Convert float → int16 dengan gain
+    for (size_t i = 0; i < num_samples; i++)
+    {
+      i2s_data[i * 2] = (int16_t)constrain(buf_hpf[i] * gain_tweeter, -32768, 32767);    // R → Tweeter
+      i2s_data[i * 2 + 1] = (int16_t)constrain(buf_lpf[i] * gain_woofer, -32768, 32767); // L → Woofer
+    }
+
+    size_t i2s_bytes_written;
+    i2s_write(I2S_NUM_0, i2s_data, sizeof(int16_t) * num_samples * 2, &i2s_bytes_written, portMAX_DELAY);
+  } else {
+    // Stereo normal tanpa crossover, langsung kirim ke DAC
+    size_t num_samples = len / 4;      // LLSB, LMSB, RLSB, RMSB, so divide by 4 per point
+    int16_t i2s_data[num_samples * 2]; // Create a temporary buffer for 16-bit stereo samples
+
+    for (size_t i = 0; i < num_samples; i++)
+    {
+      // Convert each stereo sample from uint8_t to int16_t
+      int16_t left = (data[i * 4 + 1] << 8) | data[i * 4];      // Left channel
+      int16_t right = (data[i * 4 + 3] << 8) | data[i * 4 + 2]; // Right channel
+
+      // Store the converted data in the i2s_data buffer
+      i2s_data[i * 2] = right; 
+      i2s_data[i * 2 + 1] = left;
+    }
+    size_t i2s_bytes_written;
+    i2s_write(I2S_NUM_0, i2s_data, sizeof(i2s_data), &i2s_bytes_written, portMAX_DELAY); // sent to DAC
   }
-
-  // LPF cascade 2x → Woofer (Linkwitz-Riley 24dB/oct)
-  dsps_biquad_f32(buf_mono, buf_lpf, num_samples, coeffs_lpf1, w_lpf1);
-  dsps_biquad_f32(buf_lpf,  buf_lpf, num_samples, coeffs_lpf2, w_lpf2);
-
-  // HPF cascade 2x → Tweeter (Linkwitz-Riley 24dB/oct)
-  dsps_biquad_f32(buf_mono, buf_hpf, num_samples, coeffs_hpf1, w_hpf1);
-  dsps_biquad_f32(buf_hpf,  buf_hpf, num_samples, coeffs_hpf2, w_hpf2);
-
-  // Convert float → int16 dengan gain
-  for (size_t i = 0; i < num_samples; i++)
-  {
-    i2s_data[i * 2] = (int16_t)constrain(buf_hpf[i] * gain_tweeter, -32768, 32767);    // R → Tweeter
-    i2s_data[i * 2 + 1] = (int16_t)constrain(buf_lpf[i] * gain_woofer, -32768, 32767); // L → Woofer
-  }
-
-  size_t i2s_bytes_written;
-  i2s_write(I2S_NUM_0, i2s_data, sizeof(int16_t) * num_samples * 2, &i2s_bytes_written, portMAX_DELAY);
 }
 
 // Fungsi simpan & load settings
 void save_settings()
 {
   prefs.begin("speaker", false); // namespace "speaker", mode read-write
+  prefs.putFloat("mono", mono_mode);
   prefs.putFloat("freq", crossover_freq);
   prefs.putFloat("gain_w", gain_woofer);
   prefs.putFloat("gain_t", gain_tweeter);
@@ -181,6 +205,7 @@ void save_settings()
 void load_settings()
 {
   prefs.begin("speaker", true);                     // mode read-only
+  mono_mode = prefs.getFloat("mono", true);              // default true
   crossover_freq = prefs.getFloat("freq", 5000.0f); // default 5000 Hz
   gain_woofer = prefs.getFloat("gain_w", 1.0f);     // default 1.0
   gain_tweeter = prefs.getFloat("gain_t", 1.0f);    // default 1.0
@@ -199,7 +224,25 @@ void handle_serial()
   String cmd = Serial.readStringUntil('\n');
   cmd.trim();
 
-  if (cmd.startsWith("freq:"))
+  if (cmd.startsWith("mono:"))
+  {
+    String val = cmd.substring(5);
+    if (val == "on")
+    {
+      mono_mode = true;
+      Serial.println("Mono mix diaktifkan");
+    }
+    else if (val == "off")
+    {
+      mono_mode = false;
+      Serial.println("Mono mix dinonaktifkan (stereo passthrough)");
+    }
+    else
+    {
+      Serial.println("Nilai tidak valid. Gunakan 'mono:on' atau 'mono:off'");
+    }
+  }
+  else if (cmd.startsWith("freq:"))
   {
     float freq = cmd.substring(5).toFloat();
     if (freq > 100 && freq < 20000)
@@ -242,6 +285,7 @@ void handle_serial()
   else if (cmd == "reset")
   {
     // Reset ke default
+    mono_mode = true;
     crossover_freq = 5000.0f;
     gain_woofer = 1.0f;
     gain_tweeter = 1.0f;
@@ -256,6 +300,7 @@ void handle_serial()
   }
   else if (cmd == "status")
   {
+    Serial.printf("Mono Mix    : %s\n", mono_mode ? "on" : "off");
     Serial.printf("Crossover   : %.0f Hz\n", crossover_freq);
     Serial.printf("Gain Woofer : %.2f\n", gain_woofer);
     Serial.printf("Gain Tweeter: %.2f\n", gain_tweeter);
@@ -265,6 +310,7 @@ void handle_serial()
   else if (cmd == "help")
   {
     Serial.println("=== Serial Controller ===");
+    Serial.println("mono:<val>    → mono mix (contoh: on/off)");
     Serial.println("freq:<Hz>     → ubah crossover (100-20000)");
     Serial.println("gain_w:<val>  → gain woofer  (contoh: 1.2)");
     Serial.println("gain_t:<val>  → gain tweeter (contoh: 0.8)");
