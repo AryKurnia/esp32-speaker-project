@@ -10,6 +10,10 @@
 #include <Wire.h>
 
 #define BTLED 2
+#define ENC_CLK 32
+#define ENC_DT  33
+#define ENC_SW  34
+
 BluetoothA2DPSink a2dp_sink;
 Preferences prefs;
 
@@ -54,6 +58,23 @@ float gain_woofer = 1.0f;
 float gain_tweeter = 1.0f;
 
 bool mono_mode = true; // true = mono mix, false = stereo passthrough (LPF ke L, HPF ke R)
+
+// ─── UI STATE MACHINE ─────────────────────────────────────────
+enum UIState  { IDLE, NAVIGATE, EDIT };
+enum UIParam  { PARAM_FREQ, PARAM_GAIN_W, PARAM_GAIN_T, PARAM_WAV_VOL, PARAM_MODE, PARAM_COUNT };
+
+UIState  ui_state       = IDLE;
+UIParam  selected_param = PARAM_FREQ;
+
+unsigned long last_interaction = 0;
+const unsigned long TIMEOUT_MS = 5000;
+
+// Untuk efek kedip
+bool     blink_state    = false;
+unsigned long last_blink = 0;
+const unsigned long BLINK_FAST = 200; // ms — mode EDIT
+const unsigned long BLINK_SLOW = 600; // ms — mode NAVIGATE
+// ==============================================================
 
 // Fungsi hitung ulang koefisien (dipanggil saat freq berubah)
 void update_crossover(float freq_hz) {
@@ -127,33 +148,177 @@ U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(
 );
 
 // Panggil fungsi ini setiap kali ada perubahan status
+// Label parameter
+const char* param_labels[] = { "Freq", "GainW", "GainT", "WVol", "Mode" };
+
 void update_display() {
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tr); // font kecil, cocok untuk 128x32
+  u8g2.setFont(u8g2_font_6x10_tr);
 
-  // Baris 1 — Status BT
-  u8g2.drawStr(0, 10, a2dp_sink.is_connected() ? "BT: Connected" : "BT: Waiting...");
+  if (ui_state == IDLE) {
+    // ── Tampilan normal ──
+    u8g2.drawStr(0, 10, a2dp_sink.is_connected() ? "BT: Connected" : "BT: Waiting...");
 
-  // Baris 2 — Freq & Mode
-  char line2[32];
-  snprintf(line2, sizeof(line2), "Freq:%dHz %s",
-            (int)crossover_freq,
-            mono_mode ? "XO" : "ST"); // XO=crossover, ST=stereo
-  u8g2.drawStr(0, 22, line2);
+    char line2[32];
+    snprintf(line2, sizeof(line2), "Freq:%dHz %s",
+              (int)crossover_freq, mono_mode ? "XO" : "ST");
+    u8g2.drawStr(0, 22, line2);
 
-  // Baris 3 — Gain & Volume
-  char line3[32];
-  snprintf(line3, sizeof(line3), "W:%.1f T:%.1f V:%d%%",
-            gain_woofer,
-            gain_tweeter,
-            (int)(wav_volume * 100));
-  u8g2.drawStr(0, 32, line3);
+    char line3[32];
+    snprintf(line3, sizeof(line3), "W:%.1f T:%.1f V:%d%%",
+              gain_woofer, gain_tweeter, (int)(wav_volume * 100));
+    u8g2.drawStr(0, 32, line3);
 
-  // baris 4 - menampilkan lagu yang terplay (jika ada)
+  } else {
+    // ── Tampilan NAVIGATE / EDIT ──
+    // Tampilkan semua parameter, highlight yang dipilih
+    const char* param_names[PARAM_COUNT] = {
+      "Freq", "Gain W", "Gain T", "WAV Vol", "Mode"
+    };
+
+    char param_values[PARAM_COUNT][16];
+    snprintf(param_values[PARAM_FREQ],    sizeof(param_values[0]), "%dHz", (int)crossover_freq);
+    snprintf(param_values[PARAM_GAIN_W],  sizeof(param_values[1]), "%.1f", gain_woofer);
+    snprintf(param_values[PARAM_GAIN_T],  sizeof(param_values[2]), "%.1f", gain_tweeter);
+    snprintf(param_values[PARAM_WAV_VOL], sizeof(param_values[3]), "%d%%", (int)(wav_volume * 100));
+    snprintf(param_values[PARAM_MODE],    sizeof(param_values[4]), mono_mode ? "XO" : "ST");
+
+    // Tampilkan max 3 parameter sekaligus (scroll sederhana)
+    int start = (selected_param > 1) ? selected_param - 1 : 0;
+    if (start + 3 > PARAM_COUNT) start = PARAM_COUNT - 3;
+
+    for (int i = 0; i < 3; i++) {
+      int idx = start + i;
+      if (idx >= PARAM_COUNT) break;
+
+      char line[32];
+      snprintf(line, sizeof(line), "%s: %s", param_names[idx], param_values[idx]);
+
+      bool is_selected = (idx == selected_param);
+
+      if (is_selected && blink_state) {
+        // Highlight dengan kotak
+        u8g2.setDrawColor(1);
+        u8g2.drawBox(0, (i * 11), 128, 11);
+        u8g2.setDrawColor(0); // teks hitam di atas kotak putih
+        u8g2.drawStr(2, (i * 11) + 9, line);
+        u8g2.setDrawColor(1); // reset warna
+      } else {
+        u8g2.drawStr(2, (i * 11) + 9, line);
+      }
+    }
+  }
 
   u8g2.sendBuffer();
+  // display_needs_update = false;
 }
 // ============
+
+// =================Fungsi simpan & load settings================
+void save_settings()
+{
+  prefs.begin("speaker", false); // namespace "speaker", mode read-write
+  prefs.putFloat("mono", mono_mode);
+  prefs.putFloat("freq", crossover_freq);
+  prefs.putFloat("gain_w", gain_woofer);
+  prefs.putFloat("gain_t", gain_tweeter);
+  prefs.putFloat("wav_vol", wav_volume);
+  prefs.end();
+  Serial.println("Settings tersimpan!");
+}
+// ============================================================
+
+// ─── ROTARY ENCODER ───────────────────────────────────────────
+int  last_clk        = HIGH;
+bool sw_last         = HIGH;
+unsigned long sw_debounce = 0;
+
+void handle_encoder() {
+    // ── Baca rotasi ──
+    int clk_val = digitalRead(ENC_CLK);
+    if (clk_val != last_clk && clk_val == LOW) {
+        last_interaction = millis(); // reset timeout
+
+        int dt_val = digitalRead(ENC_DT);
+        bool cw = (dt_val != clk_val); // clockwise?
+
+        if (ui_state == IDLE) {
+            ui_state = NAVIGATE;
+
+        } else if (ui_state == NAVIGATE) {
+            // Pindah sorotan parameter
+            if (cw) {
+                selected_param = (UIParam)((selected_param + 1) % PARAM_COUNT);
+            } else {
+                selected_param = (UIParam)((selected_param - 1 + PARAM_COUNT) % PARAM_COUNT);
+            }
+
+        } else if (ui_state == EDIT) {
+            // Ubah nilai parameter
+            switch (selected_param) {
+                case PARAM_FREQ:
+                    crossover_freq = constrain(crossover_freq + (cw ? 100 : -100), 100, 20000);
+                    update_crossover(crossover_freq);
+                    break;
+                case PARAM_GAIN_W:
+                    gain_woofer = constrain(gain_woofer + (cw ? 0.1f : -0.1f), 0.0f, 2.0f);
+                    break;
+                case PARAM_GAIN_T:
+                    gain_tweeter = constrain(gain_tweeter + (cw ? 0.1f : -0.1f), 0.0f, 2.0f);
+                    break;
+                case PARAM_WAV_VOL:
+                    wav_volume = constrain(wav_volume + (cw ? 0.1f : -0.1f), 0.0f, 1.0f);
+                    break;
+                case PARAM_MODE:
+                    mono_mode = !mono_mode;
+                    break;
+                default: break;
+            }
+        }
+
+        update_display();
+    }
+    last_clk = clk_val;
+
+    // ── Baca tombol (SW) ──
+    bool sw_val = digitalRead(ENC_SW);
+    if (sw_val == LOW && sw_last == HIGH && millis() - sw_debounce > 200) {
+        sw_debounce      = millis();
+        last_interaction = millis();
+
+        if (ui_state == IDLE) {
+            ui_state = NAVIGATE;
+
+        } else if (ui_state == NAVIGATE) {
+            ui_state = EDIT;
+
+        } else if (ui_state == EDIT) {
+            save_settings();
+            ui_state = NAVIGATE;
+        }
+
+        update_display();
+    }
+    sw_last = sw_val;
+}
+
+void handle_timeout() {
+    if (ui_state != IDLE && millis() - last_interaction > TIMEOUT_MS) {
+        if (ui_state == EDIT) save_settings(); // simpan otomatis
+        ui_state = IDLE;
+        update_display();
+    }
+}
+
+void handle_blink() {
+    unsigned long interval = (ui_state == EDIT) ? BLINK_FAST : BLINK_SLOW;
+    if (millis() - last_blink > interval) {
+        blink_state = !blink_state;
+        last_blink  = millis();
+        if (ui_state != IDLE) update_display();
+    }
+}
+// ==============================================================
 
 // ─── BLUETOOTH CALLBACK ───────────────────────────────────────
 void bt_connection_state_changed(esp_a2d_connection_state_t state, void *ptr)
@@ -229,19 +394,6 @@ void audio_data_callback(const uint8_t *data, uint32_t len) // BT data on 8bit f
     size_t i2s_bytes_written;
     i2s_write(I2S_NUM_0, i2s_data, sizeof(i2s_data), &i2s_bytes_written, portMAX_DELAY); // sent to DAC
   }
-}
-
-// Fungsi simpan & load settings
-void save_settings()
-{
-  prefs.begin("speaker", false); // namespace "speaker", mode read-write
-  prefs.putFloat("mono", mono_mode);
-  prefs.putFloat("freq", crossover_freq);
-  prefs.putFloat("gain_w", gain_woofer);
-  prefs.putFloat("gain_t", gain_tweeter);
-  prefs.putFloat("wav_vol", wav_volume);
-  prefs.end();
-  Serial.println("Settings tersimpan!");
 }
 
 void load_settings()
@@ -383,8 +535,13 @@ void handle_serial()
 void setup()
 {
   Serial.begin(115200);
-  u8g2.begin();
 
+  // Rotary encoder
+  pinMode(ENC_CLK, INPUT_PULLUP);
+  pinMode(ENC_DT,  INPUT_PULLUP);
+  pinMode(ENC_SW,  INPUT_PULLUP);
+
+  u8g2.begin();
   update_display();
 
   load_settings();
@@ -418,5 +575,8 @@ void loop()
 {
   digitalWrite(BTLED, a2dp_sink.is_connected() ? HIGH : LOW);
   handle_serial();
+  handle_encoder();
+  handle_timeout();
+  handle_blink();
   // update_display();
 }
