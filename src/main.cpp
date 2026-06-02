@@ -163,8 +163,8 @@ void audio_data_callback(const uint8_t *data, uint32_t len) // BT data on 8bit f
     // Convert float → int16 dengan gain
     for (size_t i = 0; i < num_samples; i++)
     {
-      i2s_data[i * 2] = (int16_t)constrain(buf_hpf[i] * gain_tweeter, -32768, 32767);    // R → Tweeter
-      i2s_data[i * 2 + 1] = (int16_t)constrain(buf_lpf[i] * gain_woofer, -32768, 32767); // L → Woofer
+      i2s_data[i * 2] = (int16_t)constrain(buf_lpf[i] * gain_woofer, -32768, 32767); // L → Woofer
+      i2s_data[i * 2 + 1] = (int16_t)constrain(buf_hpf[i] * gain_tweeter, -32768, 32767);    // R → Tweeter
     }
 
     size_t i2s_bytes_written;
