@@ -6,6 +6,8 @@
 #include "dsps_biquad.h"     // ESP-DSP
 #include "dsps_biquad_gen.h" // ESP-DSP coefficient generator
 #include <Preferences.h>
+#include <U8g2lib.h>
+#include <Wire.h>
 
 #define BTLED 2
 BluetoothA2DPSink a2dp_sink;
@@ -114,6 +116,45 @@ void play_wav(const char *filename)
   xTaskCreate(wav_task, "wav_task", 8192, NULL, 1, NULL);
 }
 
+// Bris program untuk LCD
+// SSD1306 128x32 I2C
+// Parameter: rotasi, reset pin, SCL, SDA
+U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(
+  U8G2_R0,        // rotasi normal
+  U8X8_PIN_NONE,  // tidak pakai pin reset
+  19,             // SCL
+  21              // SDA
+);
+
+// Panggil fungsi ini setiap kali ada perubahan status
+void update_display() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tr); // font kecil, cocok untuk 128x32
+
+  // Baris 1 — Status BT
+  u8g2.drawStr(0, 10, a2dp_sink.is_connected() ? "BT: Connected" : "BT: Waiting...");
+
+  // Baris 2 — Freq & Mode
+  char line2[32];
+  snprintf(line2, sizeof(line2), "Freq:%dHz %s",
+            (int)crossover_freq,
+            mono_mode ? "XO" : "ST"); // XO=crossover, ST=stereo
+  u8g2.drawStr(0, 22, line2);
+
+  // Baris 3 — Gain & Volume
+  char line3[32];
+  snprintf(line3, sizeof(line3), "W:%.1f T:%.1f V:%d%%",
+            gain_woofer,
+            gain_tweeter,
+            (int)(wav_volume * 100));
+  u8g2.drawStr(0, 32, line3);
+
+  // baris 4 - menampilkan lagu yang terplay (jika ada)
+
+  u8g2.sendBuffer();
+}
+// ============
+
 // ─── BLUETOOTH CALLBACK ───────────────────────────────────────
 void bt_connection_state_changed(esp_a2d_connection_state_t state, void *ptr)
 {
@@ -127,6 +168,7 @@ void bt_connection_state_changed(esp_a2d_connection_state_t state, void *ptr)
     play_wav("/disconnected.wav");
     Serial.println("Bluetooth Disconnected");
   }
+  update_display();
 }
 
 // ─── AUDIO CALLBACK (DSP CROSSOVER) ──────────────────────────
@@ -181,7 +223,7 @@ void audio_data_callback(const uint8_t *data, uint32_t len) // BT data on 8bit f
       int16_t right = (data[i * 4 + 3] << 8) | data[i * 4 + 2]; // Right channel
 
       // Store the converted data in the i2s_data buffer
-      i2s_data[i * 2] = right; 
+      i2s_data[i * 2] = right;
       i2s_data[i * 2 + 1] = left;
     }
     size_t i2s_bytes_written;
@@ -205,7 +247,7 @@ void save_settings()
 void load_settings()
 {
   prefs.begin("speaker", true);                     // mode read-only
-  mono_mode = prefs.getFloat("mono", true);              // default true
+  mono_mode = prefs.getFloat("mono", true);         // default true
   crossover_freq = prefs.getFloat("freq", 5000.0f); // default 5000 Hz
   gain_woofer = prefs.getFloat("gain_w", 1.0f);     // default 1.0
   gain_tweeter = prefs.getFloat("gain_t", 1.0f);    // default 1.0
@@ -213,6 +255,7 @@ void load_settings()
   prefs.end();
   Serial.printf("Settings loaded → freq:%.0f gain_w:%.2f gain_t:%.2f wav_vol:%.2f\n",
                 crossover_freq, gain_woofer, gain_tweeter, wav_volume);
+  update_display();
 }
 
 // ─── SERIAL CONTROLLER ────────────────────────────────────────
@@ -231,11 +274,13 @@ void handle_serial()
     {
       mono_mode = true;
       Serial.println("Mono mix diaktifkan");
+      update_display();
     }
     else if (val == "off")
     {
       mono_mode = false;
       Serial.println("Mono mix dinonaktifkan (stereo passthrough)");
+      update_display();
     }
     else
     {
@@ -249,6 +294,7 @@ void handle_serial()
     {
       crossover_freq = freq;
       update_crossover(crossover_freq);
+      update_display();
     }
     else
     {
@@ -259,11 +305,13 @@ void handle_serial()
   {
     gain_woofer = cmd.substring(7).toFloat();
     Serial.printf("Gain woofer: %.2f\n", gain_woofer);
+    update_display();
   }
   else if (cmd.startsWith("gain_t:"))
   {
     gain_tweeter = cmd.substring(7).toFloat();
     Serial.printf("Gain tweeter: %.2f\n", gain_tweeter);
+    update_display();
   }
   else if (cmd.startsWith("wav_vol:"))
   {
@@ -272,6 +320,7 @@ void handle_serial()
     {
       wav_volume = vol;
       Serial.printf("WAV volume: %.0f%%\n", vol * 100);
+      update_display();
     }
     else
     {
@@ -334,6 +383,9 @@ void handle_serial()
 void setup()
 {
   Serial.begin(115200);
+  u8g2.begin();
+
+  update_display();
 
   load_settings();
   update_crossover(crossover_freq);
@@ -366,4 +418,5 @@ void loop()
 {
   digitalWrite(BTLED, a2dp_sink.is_connected() ? HIGH : LOW);
   handle_serial();
+  // update_display();
 }
