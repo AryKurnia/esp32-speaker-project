@@ -144,7 +144,7 @@ TrackInfo track_info = {"", "", 0, 0, false};
 int scroll_x_title  = 0;
 int scroll_x_artist = 0;
 unsigned long last_scroll = 0;
-const int SCROLL_SPEED_MS = 150;
+const int SCROLL_SPEED_MS = 80;
 bool scroll_pausing = false;
 unsigned long scroll_pause_start = 0;
 const int SCROLL_PAUSE_MS = 2000;
@@ -860,9 +860,13 @@ void avrc_metadata_callback(uint8_t id, const uint8_t *text) {
 // Callback posisi lagu (progress)
 void avrc_rn_play_pos_callback(uint32_t play_pos) {
     track_info.position_ms = play_pos;
-    update_display();
+    // update_display();
 }
 // =================================================================
+
+// ─── UI REFRESH CONFIG ─────────────────────────────────────────
+unsigned long last_ui_update = 0;
+const unsigned long UI_REFRESH_MS = 100;
 
 // ─── SETUP ────────────────────────────────────────────────────
 void setup()
@@ -929,5 +933,10 @@ void loop()
   handle_encoder();
   handle_timeout();
   handle_blink();
-  // update_display();
+
+  // Refresh layar hanya setiap 100ms
+  if (millis() - last_ui_update > UI_REFRESH_MS) {
+    last_ui_update = millis();
+    update_display();
+  }
 }
