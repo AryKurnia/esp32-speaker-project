@@ -53,7 +53,7 @@ void dsp_biquad(float *in, float *out, int len, float *c, float *w) {
 #define BTLED   2
 #define ENC_CLK 32
 #define ENC_DT  33
-#define ENC_SW  27  // ← GPIO27 (bukan 34, karena 34 tidak support pull-up)
+#define ENC_SW  27
 
 BluetoothA2DPSink a2dp_sink;
 
