@@ -169,6 +169,7 @@ void update_crossover(float freq_hz) {
 // ─── LITTLEFS / WAV CHIME ─────────────────────────────────────
 static char wav_to_play[32] = "";
 float wav_volume = 0.7f;
+volatile bool startup_done = false;
 
 void wav_task(void *param)
 {
@@ -191,13 +192,17 @@ void wav_task(void *param)
       while (file.available())
       {
         size_t bytes_read  = file.read(raw, sizeof(raw));
-        size_t num_samples = bytes_read / 2;
+          // Dibagi 4 karena 1 sampel stereo = 4 byte (16-bit L + 16-bit R)
+          size_t num_samples = bytes_read / 4; 
 
-        // Convert ke float + apply volume
-        for (size_t i = 0; i < num_samples; i++) {
-          int16_t s = (raw[i*2+1] << 8) | raw[i*2];
-          fbuf[i]   = (float)s * wav_volume;
-        }
+          // Convert ke float + apply volume (Mix Stereo ke Mono)
+          for (size_t i = 0; i < num_samples; i++) {
+            int16_t left  = (raw[i*4+1] << 8) | raw[i*4];
+            int16_t right = (raw[i*4+3] << 8) | raw[i*4+2];
+            
+            // Gabungkan kiri dan kanan lalu bagi 2 untuk dijadikan mono
+            fbuf[i] = (float)((left + right) / 2.0f) * wav_volume; 
+          }
 
         if (mono_mode) {
           // Apply crossover
@@ -228,6 +233,7 @@ void wav_task(void *param)
     }
     wav_to_play[0] = '\0';
   }
+  startup_done = true;
   vTaskDelete(NULL);
 }
 
@@ -888,6 +894,17 @@ void setup()
 
   i2s_driver_install(I2S_NUM_0, &i2s_config_stereo, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pin_config);
+
+  // --- EKSEKUSI STARTUP SOUND ---
+  Serial.println("Memutar startup sound...");
+  startup_done = false;
+  play_wav("/jbl-startup-sound-effect.wav");
+  
+  while (!startup_done) {
+    vTaskDelay(pdMS_TO_TICKS(10)); // Tunggu hingga wav_task selesai
+  }
+  Serial.println("Startup sound selesai.");
+  // ------------------------------
 
   a2dp_sink.set_on_connection_state_changed(bt_connection_state_changed);
   a2dp_sink.set_stream_reader(audio_data_callback, false);
