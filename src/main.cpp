@@ -48,6 +48,19 @@ void dsp_biquad(float *in, float *out, int len, float *c, float *w) {
 #define ENC_DT  33
 #define ENC_SW  27
 
+// DAC Jatah Pin
+#define XSMT_PIN 23  // GPIO23 → XSMT PCM5102A
+
+void dac_mute() {
+  digitalWrite(XSMT_PIN, LOW);
+  Serial.println("[DAC] Muted");
+}
+
+void dac_unmute() {
+  digitalWrite(XSMT_PIN, HIGH);
+  Serial.println("[DAC] Unmuted");
+}
+
 BluetoothA2DPSink a2dp_sink;
 Preferences prefs;
 
@@ -170,6 +183,11 @@ void update_crossover(float freq_hz) {
 static char wav_to_play[32] = "";
 float wav_volume = 0.7f;
 volatile bool startup_done = false;
+bool was_connected = false;
+bool reconnect_window_open = true;
+
+bool is_startup = true;  // true sampai window reconnect selesai
+bool ever_connected = false; // true kalau pernah konek sejak startup
 
 void wav_task(void *param)
 {
@@ -233,12 +251,20 @@ void wav_task(void *param)
     }
     wav_to_play[0] = '\0';
   }
+  
+  // Mute kembali setelah WAV selesai
+  // Hanya mute kalau BT tidak sedang streaming
+  if (!a2dp_sink.is_connected()) {
+    dac_mute();
+  }
+  
   startup_done = true;
   vTaskDelete(NULL);
 }
 
 void play_wav(const char *filename)
 {
+  dac_unmute(); // ← unmute sebelum play
   strncpy(wav_to_play, filename, sizeof(wav_to_play));
   xTaskCreate(wav_task, "wav_task", 8192, NULL, 1, NULL);
 }
@@ -247,7 +273,7 @@ void play_wav(const char *filename)
 // SSD1306 128x32 I2C
 // Parameter: rotasi, reset pin, SCL, SDA
 U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(
-  U8G2_R0,        // rotasi normal
+  U8G2_R2,        // [U8G2_R2](rotasi 180°)||[U8G2_R0](rotasi normal)
   U8X8_PIN_NONE,  // tidak pakai pin reset
   19,             // SCL
   21              // SDA
@@ -359,7 +385,21 @@ void update_display()
   }
   else if (current_page == PAGE_NOWPLAY)
   {
-    if (!a2dp_sink.is_connected() || !track_info.has_data)
+    if (is_startup) {
+      // Start Up
+      u8g2.drawStr(30, 18, "Start Up");
+    }
+    else if (!a2dp_sink.is_connected()){
+      if (!ever_connected)
+      {
+        u8g2.drawStr(30, 18, "Reconnect...");
+      }
+      else if (ever_connected)
+      {
+        u8g2.drawStr(30, 18, "Waiting...");
+      }
+    }
+    else if (!a2dp_sink.is_connected() || !track_info.has_data)
     {
       // Tidak ada musik
       u8g2.drawStr(30, 18, "No Music");
@@ -631,13 +671,24 @@ void bt_connection_state_changed(esp_a2d_connection_state_t state, void *ptr)
 {
   if (state == ESP_A2D_CONNECTION_STATE_CONNECTED)
   {
+    was_connected = true;
+    ever_connected = true;
     play_wav("/connected.wav");
-    Serial.println("Bluetooth Connected");
+    Serial.println("[BT] Connected");
   }
   else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED)
   {
-    play_wav("/disconnected.wav");
-    Serial.println("Bluetooth Disconnected");
+    if (was_connected)
+    {
+      // Hanya play disconnected.wav kalau sebelumnya memang konek
+      play_wav("/disconnected.wav");
+      Serial.println("[BT] Disconnected");
+    }
+    else
+    {
+      Serial.println("[BT] Ready (waiting...)");
+    }
+    was_connected = false;
   }
   update_display();
 }
@@ -652,6 +703,13 @@ static float buf_hpf[1024],  buf_hpf2[1024];
 // change 8bit format to 16bit format, easier to process later
 void audio_data_callback(const uint8_t *data, uint32_t len)
 {
+  // Unmute DAC saat ada audio
+  static bool is_unmuted = false;
+  if (!is_unmuted) {
+    dac_unmute();
+    is_unmuted = true;
+  }
+
   if (mono_mode) {
     // DSP crossover
     size_t num_samples = len / 4;
@@ -895,6 +953,8 @@ void setup()
   Serial.println("DSP Crossover OK");
 
   pinMode(BTLED, OUTPUT);
+  pinMode(XSMT_PIN, OUTPUT);
+  digitalWrite(XSMT_PIN, LOW);
 
   i2s_driver_install(I2S_NUM_0, &i2s_config_stereo, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pin_config);
@@ -902,12 +962,14 @@ void setup()
   // --- EKSEKUSI STARTUP SOUND ---
   Serial.println("Memutar startup sound...");
   startup_done = false;
-  play_wav("/jbl-startup-sound-effect.wav");
+  play_wav("/startup-sound-effect.wav");
   
   while (!startup_done) {
     vTaskDelay(pdMS_TO_TICKS(10)); // Tunggu hingga wav_task selesai
   }
   Serial.println("Startup sound selesai.");
+  is_startup = false;
+  update_display();
   // ------------------------------
 
   a2dp_sink.set_on_connection_state_changed(bt_connection_state_changed);
@@ -920,9 +982,36 @@ void setup()
   );
   a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
   a2dp_sink.set_avrc_rn_play_pos_callback(avrc_rn_play_pos_callback, 1);
-  a2dp_sink.start("Speaker Mahal 😁");
+  a2dp_sink.start("Oke Gass ✌️");
 
   Serial.println("Ready! Ketik 'help' untuk daftar perintah.");
+
+  // ── Window Tunggu Auto-reconnect (6 detik) ──
+  const unsigned long RECONNECT_WINDOW = 6000;
+  unsigned long wait_start = millis();
+
+  while (millis() - wait_start < RECONNECT_WINDOW)
+  {
+    if (was_connected)
+    {
+      Serial.println("[BT] Auto-reconnect berhasil!");
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
+  if (!was_connected)
+  {
+    Serial.println("[BT] Tidak ada reconnect → play waiting.wav");
+    startup_done = false;
+    play_wav("/waiting.wav");
+    while (!startup_done)
+    {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ever_connected = true;
+    update_display();
+  }
 }
 
 // ─── LOOP ─────────────────────────────────────────────────────
