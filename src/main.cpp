@@ -50,14 +50,18 @@ void dsp_biquad(float *in, float *out, int len, float *c, float *w) {
 
 // DAC Jatah Pin
 #define XSMT_PIN 23  // GPIO23 → XSMT PCM5102A
+// AMPLI jatah Pin
+#define PAM_M_PIN 17 // GPIO23 -> PAM MUTE
 
 void dac_mute() {
   digitalWrite(XSMT_PIN, LOW);
+  digitalWrite(PAM_M_PIN, HIGH);
   Serial.println("[DAC] Muted");
 }
 
 void dac_unmute() {
   digitalWrite(XSMT_PIN, HIGH);
+  digitalWrite(PAM_M_PIN, LOW);
   Serial.println("[DAC] Unmuted");
 }
 
@@ -251,7 +255,7 @@ void wav_task(void *param)
     }
     wav_to_play[0] = '\0';
   }
-  
+
   // Mute kembali setelah WAV selesai
   // Hanya mute kalau BT tidak sedang streaming
   if (!a2dp_sink.is_connected()) {
@@ -954,7 +958,9 @@ void setup()
 
   pinMode(BTLED, OUTPUT);
   pinMode(XSMT_PIN, OUTPUT);
+  pinMode(PAM_M_PIN, OUTPUT);
   digitalWrite(XSMT_PIN, LOW);
+  digitalWrite(PAM_M_PIN, HIGH);
 
   i2s_driver_install(I2S_NUM_0, &i2s_config_stereo, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pin_config);
