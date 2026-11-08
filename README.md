@@ -15,6 +15,7 @@ Speaker Bluetooth DIY berbasis ESP32 dengan DSP crossover digital, DAC PCM5102A,
 - **Serial Controller** — kontrol parameter audio realtime via Serial Monitor
 - **Persistent Settings** — simpan konfigurasi ke flash (NVS) agar tidak hilang saat restart
 - **LED Indicator** — indikator status koneksi Bluetooth
+- **Web Setting via WiFi** — atur bass, crossover, dan level dari browser HP
 
 ---
 
@@ -79,13 +80,20 @@ Adaptor 12V 5A
 esp32-speaker/
 ├── src/
 │   ├── main.cpp
-│   └── dsp/
-│       ├── crossover.cpp
-│       ├── crossover.h
-│       └── dsp_config.h
+│   ├── dsp/
+│   │   ├── crossover.cpp
+│   │   ├── crossover.h
+│   │   └── dsp_config.h
+│   ├── web/
+│   │   ├── web_control.cpp
+│   │   ├── web_control.h
+│   │   └── web_page.h
+│   └── audio/
+│       └── wav_header.h
 ├── data/
 │   ├── connected.wav      ← chime BT konek
-│   └── disconnected.wav   ← chime BT disconnect
+│   ├── disconnected.wav   ← chime BT disconnect
+│   └── sample.wav         ← musik contoh di mode setting
 ├── platformio.ini
 ├── .gitignore
 └── README.md
@@ -159,6 +167,56 @@ Buka Serial Monitor (115200 baud) dan ketik perintah:
 Perubahan bass langsung diterapkan tanpa compile ulang. Gunakan `save` agar
 frekuensi dan gain low-shelf tetap tersimpan setelah restart. Gunakan `status`
 untuk melihat nilai aktif.
+
+---
+
+## 📶 Mode Setting Lewat WiFi
+
+1. Saat speaker menyala, tahan tombol **BOOT** selama 2 detik. Speaker restart ke
+   mode setting: Bluetooth mati, WiFi menyala, dan LED berkedip pelan.
+2. Sambungkan HP ke WiFi `OkeGass-Setup` (tanpa password). Halaman setting
+   biasanya terbuka sendiri (captive portal). Kalau tidak, ketuk notifikasi
+   "Masuk ke jaringan", atau buka `http://192.168.4.1` di browser.
+3. Di iPhone, halaman terbuka di jendela khusus. Jangan menutupnya dengan
+   **Batal**, karena iPhone bisa memutus WiFi speaker; pilih "Gunakan tanpa
+   Internet".
+4. Centang **Putar musik contoh** kalau ingin mendengar hasil setting secara
+   langsung, atur setting, lalu tekan **Simpan**.
+5. Tekan **Selesai** untuk kembali ke mode Bluetooth.
+
+Kembali ke Bluetooth selalu lewat hitung mundur 7 detik (LED berkedip cepat).
+Selama itu hitung mundur bisa dibatalkan lewat tombol **Batal** di halaman, atau
+dengan menekan BOOT sekali. Hitung mundur juga bisa dimulai dengan menahan BOOT
+2 detik di mode setting. Setting yang belum disimpan hilang setelah speaker
+kembali ke Bluetooth; halaman menampilkan peringatan kalau masih ada.
+
+Speaker juga kembali ke Bluetooth setelah 5 menit tanpa aktivitas di halaman.
+Mencabut listrik selalu membuat speaker menyala di mode Bluetooth.
+
+Perintah Serial: `config:on`, `config:off`, `config:cancel`, `sample:on`,
+`sample:off`.
+
+### Musik contoh (`data/sample.wav`)
+
+Diputar berulang di mode setting setelah **Putar musik contoh** dicentang (default
+mati), lewat DSP yang sama dengan musik Bluetooth, dengan fade-in 0,5 detik dan
+fade-out 0,15 detik.
+Format yang diterima: WAV PCM 16-bit, 44,1 kHz, mono atau stereo. Mono lebih
+disarankan karena ukurannya separuh. Sisa ruang flash cukup untuk sekitar 7 detik
+mono. Contoh membuat potongan 7 detik dari lagu, mulai detik ke-45:
+
+```
+ffmpeg -ss 45 -t 7 -i lagu.mp3 -ac 1 -ar 44100 -c:a pcm_s16le \
+  -af "afade=t=in:d=0.02,afade=t=out:st=6.98:d=0.02" data/sample.wav
+```
+
+Setelah mengganti file di `data/`, jalankan **Upload Filesystem Image**.
+
+### Partisi
+
+Project ini memakai partisi `no_ota.csv`. Setelah pertama kali pindah ke partisi
+ini, jalankan `pio run -t upload` lalu `pio run -t uploadfs`, karena lokasi file
+WAV di flash ikut berubah.
 
 ---
 

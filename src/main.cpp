@@ -3,6 +3,7 @@
 #include "LittleFS.h"
 #include "BluetoothA2DPSink.h"
 #include "driver/i2s.h"
+#include "esp_bt.h"
 #include <Preferences.h>
 #include <U8g2lib.h>
 #include <Wire.h>
@@ -10,6 +11,8 @@
 #include <atomic>
 #include "dsp/crossover.h"
 #include "dsp/dsp_config.h"
+#include "web/web_control.h"
+#include "audio/wav_header.h"
 
 // Feature switches: set to 1 to enable the peripheral.
 #define FEATURE_OLED_ENABLED 0
@@ -67,7 +70,7 @@ i2s_config_t i2s_config_stereo = {
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
     .intr_alloc_flags = 0,
-    .dma_buf_count = 16,
+    .dma_buf_count = 8,
     .dma_buf_len = 512,
     .use_apll = false,
     .tx_desc_auto_clear = true,
@@ -218,60 +221,108 @@ bool reconnect_window_open = true;
 bool is_startup = true;  // true sampai window reconnect selesai
 bool ever_connected = false; // true kalau pernah konek sejak startup
 
-static void play_wav_file(const char *path)
+// Memutar WAV lewat crossover. keep_looping != nullptr: putar berulang selama
+// *keep_looping bernilai true. Return false kalau file tidak ada/format salah.
+static bool play_wav_file(const char *path, float gain, dsp::Crossover &crossover,
+                          const volatile bool *keep_looping = nullptr)
 {
   File file = LittleFS.open(path, "r");
-  if (file)
+  WavInfo info;
+  if (!file || !read_wav_header(file, info))
   {
-    file.seek(44); // skip WAV header
+    Serial.printf("WAV tidak ada atau format salah: %s\n", path);
+    if (file)
+      file.close();
+    return false;
+  }
 
-    const size_t READ_SAMPLES = 128;
-    uint8_t  raw[READ_SAMPLES * 2];       // 256 bytes
-    static float   fbuf[READ_SAMPLES];
-    static int16_t out[READ_SAMPLES * 2]; // stereo output
+  const size_t FRAMES = 128;
+  const size_t frame_bytes = info.channels * 2;
+  uint8_t raw[FRAMES * 4];
+  float fbuf[FRAMES];
+  int16_t out[FRAMES * 2];
+  size_t bytes_written;
+  uint32_t remaining = info.data_size;
 
-    size_t bytes_written;
+  // Suara contoh: fade-in saat mulai dan fade-out saat dihentikan, supaya tidak
+  // berdecak. Chime biasa diputar apa adanya.
+  const bool looping = keep_looping != nullptr;
+  const float FADE_IN_STEP = 1.0f / (0.5f * dsp::kDefaultSampleRate);
+  const float FADE_OUT_STEP = 1.0f / (0.15f * dsp::kDefaultSampleRate);
+  float fade = looping ? 0.0f : 1.0f;
+  bool stopping = false;
 
-    while (file.available())
+  for (;;)
+  {
+    if (looping && !*keep_looping)
+      stopping = true;
+    if (stopping && fade <= 0.0f)
+      break;
+    if (remaining < frame_bytes)
     {
-      size_t bytes_read  = file.read(raw, sizeof(raw));
-        // Dibagi 4 karena 1 sampel stereo = 4 byte (16-bit L + 16-bit R)
-        size_t num_samples = bytes_read / 4; 
-
-        // Convert ke float + apply volume (Mix Stereo ke Mono)
-        for (size_t i = 0; i < num_samples; i++) {
-          int16_t left  = (raw[i*4+1] << 8) | raw[i*4];
-          int16_t right = (raw[i*4+3] << 8) | raw[i*4+2];
-          
-          // Gabungkan kiri dan kanan lalu bagi 2 untuk dijadikan mono
-          fbuf[i] = (float)((left + right) / 2.0f) * wav_volume; 
-        }
-
-      if (mono_mode) {
-        for (size_t i = 0; i < num_samples; i++) {
-          float woofer, tweeter;
-          chime_crossover.processSample(fbuf[i], gain_woofer, gain_tweeter,
-                                        woofer, tweeter);
-          const int16_t left = (int16_t)constrain(woofer, -32768.0f, 32767.0f);
-          const int16_t right = (int16_t)constrain(tweeter, -32768.0f, 32767.0f);
-          set_i2s_stereo_frame(&out[i * 2], left, right);
-        }
-      } else {
-        // Stereo passthrough
-        for (size_t i = 0; i < num_samples; i++) {
-          const int16_t sample = (int16_t)constrain(fbuf[i], -32768, 32767);
-          set_i2s_stereo_frame(&out[i * 2], sample, sample);
-        }
-      }
-
-      i2s_write(I2S_NUM_0, out, num_samples * 4, &bytes_written, portMAX_DELAY);
+      // Selesai, atau ulangi dari awal data untuk suara contoh.
+      if (keep_looping == nullptr || info.data_size < frame_bytes ||
+          !file.seek(info.data_start))
+        break;
+      remaining = info.data_size;
     }
-    file.close();
+
+    size_t want = min((size_t)remaining, FRAMES * frame_bytes);
+    want -= want % frame_bytes;
+    size_t got = file.read(raw, want);
+    got -= got % frame_bytes;
+    if (got == 0)
+      break;
+    remaining -= got;
+    const size_t frames = got / frame_bytes;
+
+    // Mono mix: stereo digabung, mono dipakai apa adanya.
+    for (size_t i = 0; i < frames; i++)
+    {
+      const uint8_t *p = &raw[i * frame_bytes];
+      const int16_t left = (int16_t)(p[0] | (p[1] << 8));
+      const int16_t right = info.channels == 2 ? (int16_t)(p[2] | (p[3] << 8)) : left;
+      if (looping)
+        fade = stopping ? max(fade - FADE_OUT_STEP, 0.0f)
+                        : min(fade + FADE_IN_STEP, 1.0f);
+      fbuf[i] = ((float)left + (float)right) * 0.5f * gain * fade;
+    }
+
+    if (mono_mode)
+    {
+      for (size_t i = 0; i < frames; i++)
+      {
+        float woofer, tweeter;
+        crossover.processSample(fbuf[i], gain_woofer, gain_tweeter, woofer, tweeter);
+        const int16_t left = (int16_t)constrain(woofer, -32768.0f, 32767.0f);
+        const int16_t right = (int16_t)constrain(tweeter, -32768.0f, 32767.0f);
+        set_i2s_stereo_frame(&out[i * 2], left, right);
+      }
+    }
+    else
+    {
+      // Stereo passthrough
+      for (size_t i = 0; i < frames; i++)
+      {
+        const int16_t sample = (int16_t)constrain(fbuf[i], -32768.0f, 32767.0f);
+        set_i2s_stereo_frame(&out[i * 2], sample, sample);
+      }
+    }
+
+    i2s_write(I2S_NUM_0, out, frames * 4, &bytes_written, portMAX_DELAY);
   }
-  else
+  file.close();
+
+  if (looping)
   {
-    Serial.printf("Gagal buka: %s\n", path);
+    // Isi seluruh buffer DMA dengan hening supaya fade-out selesai terdengar
+    // sebelum DAC di-mute.
+    memset(out, 0, sizeof(out));
+    const int dma_frames = i2s_config_stereo.dma_buf_count * i2s_config_stereo.dma_buf_len;
+    for (int written = 0; written < dma_frames; written += FRAMES)
+      i2s_write(I2S_NUM_0, out, sizeof(out), &bytes_written, portMAX_DELAY);
   }
+  return true;
 }
 
 void wav_task(void *param)
@@ -281,7 +332,7 @@ void wav_task(void *param)
   {
     xQueueReceive(wav_queue, &request, portMAX_DELAY);
     dac_unmute(); // ← unmute sebelum play
-    play_wav_file(request.path);
+    play_wav_file(request.path, wav_volume, chime_crossover);
 
     // Mute kembali setelah antrean WAV habis
     // Hanya mute kalau BT tidak sedang tersambung
@@ -307,7 +358,32 @@ void play_wav(const char *filename)
 static void wait_for_wav()
 {
   while (wav_pending.load() > 0) {
+    web_control::loop();
     vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ─── SUARA CONTOH (MODE SETTING) ──────────────────────────────
+// Diputar berulang lewat crossover musik supaya perubahan setting langsung terdengar.
+static const char SAMPLE_PATH[] = "/sample.wav";
+static volatile bool sample_enabled = false;
+static bool sample_available = false;
+
+void sample_task(void *param)
+{
+  for (;;)
+  {
+    if (!sample_enabled)
+    {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    dac_unmute();
+    if (!play_wav_file(SAMPLE_PATH, 1.0f, stream_crossover, &sample_enabled))
+    {
+      sample_enabled = false;
+    }
+    dac_mute();
   }
 }
 
@@ -538,6 +614,22 @@ void update_display()
 // ============
 
 // =================Fungsi simpan & load settings================
+// Nilai setting dalam format JSON, dipakai halaman web dan deteksi perubahan.
+static String settings_values()
+{
+  char values[256];
+  snprintf(values, sizeof(values),
+           "\"mono\":%s,\"freq\":%.0f,\"gain_w\":%.2f,\"gain_t\":%.2f,"
+           "\"wav_vol\":%.2f,\"bass_hz\":%.1f,\"bass_db\":%.1f,"
+           "\"hpf_hz\":%.1f,\"punch_hz\":%.1f,\"punch_db\":%.1f",
+           mono_mode ? "true" : "false", crossover_freq, gain_woofer,
+           gain_tweeter, wav_volume, bass_shelf_freq, bass_shelf_gain_db,
+           bass_high_pass_freq, punch_freq, punch_gain_db);
+  return values;
+}
+
+static String saved_values;  // Setting yang sama dengan isi NVS
+
 void save_settings()
 {
   prefs.begin("speaker", false); // namespace "speaker", mode read-write
@@ -552,6 +644,7 @@ void save_settings()
   prefs.putFloat("punch_hz", punch_freq);
   prefs.putFloat("punch_db", punch_gain_db);
   prefs.end();
+  saved_values = settings_values();
   Serial.println("Settings tersimpan!");
 }
 
@@ -907,6 +1000,8 @@ void load_settings()
     update_punch(bass_high_pass_freq, punch_freq, punch_gain_db);
   }
 
+  saved_values = settings_values();
+
   Serial.printf("Settings loaded -> freq:%.0f gain_w:%.2f gain_t:%.2f wav_vol:%.2f bass:%.0fHz/%+.1fdB\n",
                 crossover_freq, gain_woofer, gain_tweeter, wav_volume,
                 bass_shelf_freq, bass_shelf_gain_db);
@@ -914,6 +1009,8 @@ void load_settings()
 }
 
 // ─── SERIAL CONTROLLER ────────────────────────────────────────
+void handle_command(const String &cmd);
+
 void handle_serial()
 {
   if (!Serial.available())
@@ -921,7 +1018,25 @@ void handle_serial()
 
   String cmd = Serial.readStringUntil('\n');
   cmd.trim();
+  handle_command(cmd);
+}
 
+String settings_json()
+{
+  const String values = settings_values();
+  char extra[128];
+  snprintf(extra, sizeof(extra),
+           ",\"dirty\":%s,\"exit_in\":%ld,\"sample_ok\":%s,\"sample_on\":%s}",
+           values != saved_values ? "true" : "false",
+           (long)web_control::exit_countdown_ms(),
+           sample_available ? "true" : "false",
+           sample_enabled ? "true" : "false");
+  return "{" + values + extra;
+}
+
+// Dipakai bersama oleh Serial dan halaman web.
+void handle_command(const String &cmd)
+{
   if (cmd.startsWith("mono:"))
   {
     String val = cmd.substring(5);
@@ -1054,15 +1169,31 @@ void handle_serial()
   }
   else if (cmd.startsWith("gain_w:"))
   {
-    gain_woofer = cmd.substring(7).toFloat();
-    Serial.printf("Gain woofer: %.2f\n", gain_woofer);
-    update_display();
+    float gain;
+    if (parse_float_value(cmd.substring(7), gain) && gain >= 0.0f && gain <= 2.0f)
+    {
+      gain_woofer = gain;
+      Serial.printf("Gain woofer: %.2f\n", gain_woofer);
+      update_display();
+    }
+    else
+    {
+      Serial.println("Gain woofer harus 0.0 - 2.0");
+    }
   }
   else if (cmd.startsWith("gain_t:"))
   {
-    gain_tweeter = cmd.substring(7).toFloat();
-    Serial.printf("Gain tweeter: %.2f\n", gain_tweeter);
-    update_display();
+    float gain;
+    if (parse_float_value(cmd.substring(7), gain) && gain >= 0.0f && gain <= 2.0f)
+    {
+      gain_tweeter = gain;
+      Serial.printf("Gain tweeter: %.2f\n", gain_tweeter);
+      update_display();
+    }
+    else
+    {
+      Serial.println("Gain tweeter harus 0.0 - 2.0");
+    }
   }
   else if (cmd.startsWith("wav_vol:"))
   {
@@ -1081,6 +1212,36 @@ void handle_serial()
   else if (cmd == "save")
   {
     save_settings();
+  }
+  else if (cmd == "config:on")
+  {
+    if (web_control::config_mode())
+      Serial.println("Sudah di mode setting");
+    else
+      web_control::request_config_mode();
+  }
+  else if (cmd == "config:off")
+  {
+    if (web_control::config_mode())
+      web_control::start_exit_countdown();
+    else
+      Serial.println("Tidak sedang di mode setting");
+  }
+  else if (cmd == "config:cancel")
+  {
+    web_control::cancel_exit_countdown();
+  }
+  else if (cmd == "sample:on" || cmd == "sample:off")
+  {
+    if (!web_control::config_mode())
+      Serial.println("Suara contoh hanya ada di mode setting");
+    else if (!sample_available)
+      Serial.printf("%s tidak ada atau format salah\n", SAMPLE_PATH);
+    else
+    {
+      sample_enabled = cmd == "sample:on";
+      Serial.printf("Suara contoh %s\n", sample_enabled ? "diputar" : "dihentikan");
+    }
   }
   else if (cmd == "reset")
   {
@@ -1142,6 +1303,10 @@ void handle_serial()
     Serial.println("gain_w:<val>  → gain woofer  (contoh: 1.2)");
     Serial.println("gain_t:<val>  → gain tweeter (contoh: 0.8)");
     Serial.println("wav_vol:<val> → volume nada wav, antara 0.0 - 1.0");
+    Serial.println("config:on     → restart ke mode setting (WiFi)");
+    Serial.println("config:off    → kembali ke Bluetooth (hitung mundur 7 detik)");
+    Serial.println("config:cancel → batalkan hitung mundur");
+    Serial.println("sample:on/off → putar/hentikan suara contoh (mode setting)");
     Serial.println("status        → lihat setting saat ini");
     Serial.println("save          → simpan setting saat ini");
     Serial.println("reset         → kembali ke setting default");
@@ -1186,10 +1351,50 @@ unsigned long last_ui_update = 0;
 const unsigned long UI_REFRESH_MS = 100;
 
 // ─── SETUP ────────────────────────────────────────────────────
+// btStart() bawaan Arduino memesan memori BLE yang tidak dipakai A2DP. Menyalakan
+// controller lebih dulu membebaskannya, dan WiFi butuh memori itu untuk bisa jalan.
+static bool start_bt_classic_controller()
+{
+  esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+  esp_bt_controller_config_t config = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  config.mode = ESP_BT_MODE_CLASSIC_BT;
+  return esp_bt_controller_init(&config) == ESP_OK &&
+         esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT) == ESP_OK;
+}
+
+// Mode setting: tanpa Bluetooth, WiFi aktif, suara contoh diputar berulang.
+static void start_config_mode()
+{
+  Serial.println("[Mode] Mode setting (Bluetooth mati)");
+  is_startup = false;
+  // Bluetooth tidak dipakai, jadi seluruh memorinya bisa dipakai WiFi.
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+  web_control::begin(true, handle_command, settings_json, dac_mute);
+
+  File sample = LittleFS.open(SAMPLE_PATH, "r");
+  WavInfo info;
+  sample_available = sample && read_wav_header(sample, info);
+  if (sample)
+    sample.close();
+  if (sample_available)
+  {
+    Serial.printf("Suara contoh: %s, %s, %.1f detik\n", SAMPLE_PATH,
+                  info.channels == 1 ? "mono" : "stereo",
+                  info.data_size / (info.channels * 2.0f * 44100.0f));
+  }
+  else
+  {
+    Serial.printf("Suara contoh %s tidak ada atau format salah\n", SAMPLE_PATH);
+  }
+  xTaskCreate(sample_task, "sample_task", 6144, NULL, 1, NULL);
+  update_display();
+}
+
 void setup()
 {
   Serial.begin(115200);
   initialize_gpio();
+  const bool config_mode = web_control::boot_into_config_mode();
 
 #if FEATURE_OLED_ENABLED
   u8g2.begin();
@@ -1217,6 +1422,13 @@ void setup()
   wav_queue = xQueueCreate(4, sizeof(WavRequest));
   xTaskCreate(wav_task, "wav_task", 8192, NULL, 1, NULL);
 
+  if (config_mode)
+  {
+    start_config_mode();
+    return;
+  }
+  web_control::begin(false, handle_command, settings_json, dac_mute);
+
   // --- EKSEKUSI STARTUP SOUND ---
   Serial.println("Memutar startup sound...");
   play_wav("/startup-sound-effect.wav");
@@ -1236,6 +1448,9 @@ void setup()
   );
   a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
   a2dp_sink.set_avrc_rn_play_pos_callback(avrc_rn_play_pos_callback, 1);
+  if (!start_bt_classic_controller()) {
+    Serial.println("[BT] Gagal menyalakan controller");
+  }
   a2dp_sink.start("Oke Gass ✌️");
 
   Serial.println("Ready! Ketik 'help' untuk daftar perintah.");
@@ -1251,6 +1466,7 @@ void setup()
       Serial.println("[BT] Auto-reconnect berhasil!");
       break;
     }
+    web_control::loop();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 
@@ -1267,7 +1483,16 @@ void setup()
 // ─── LOOP ─────────────────────────────────────────────────────
 void loop()
 {
-  digitalWrite(BTLED, a2dp_sink.is_connected() ? HIGH : LOW);
+  // Mode setting: LED berkedip pelan, cepat saat hitung mundur.
+  // Mode Bluetooth: LED menyala saat tersambung.
+  bool led_on = a2dp_sink.is_connected();
+  if (web_control::config_mode())
+  {
+    const uint32_t period = web_control::exit_countdown_ms() >= 0 ? 100 : 500;
+    led_on = (millis() / period) % 2 == 0;
+  }
+  digitalWrite(BTLED, led_on ? HIGH : LOW);
+  web_control::loop();
   handle_serial();
 #if FEATURE_ROTARY_ENCODER_ENABLED
   handle_encoder();
