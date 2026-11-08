@@ -3,55 +3,35 @@
 #include "LittleFS.h"
 #include "BluetoothA2DPSink.h"
 #include "driver/i2s.h"
-// #include "dsps_biquad.h"     // ESP-DSP
-// #include "dsps_biquad_gen.h" // ESP-DSP coefficient generator
+#include "esp_bt.h"
 #include <Preferences.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <stdlib.h>
+#include <atomic>
+#include "dsp/crossover.h"
+#include "dsp/dsp_config.h"
+#include "web/web_control.h"
+#include "audio/wav_header.h"
 
-// ── DSP FUNCTIONS (implementasi manual, tanpa library) ────────
-void dsp_gen_lpf(float *c, float f, float q) {
-    float w  = 2.0f * M_PI * f;
-    float cs = cosf(w), sn = sinf(w);
-    float alpha = sn / (2.0f * q);
-    float a0    = 1.0f + alpha;
-    c[0] =  ((1.0f - cs) / 2.0f) / a0; // b0
-    c[1] =   (1.0f - cs)          / a0; // b1
-    c[2] =  ((1.0f - cs) / 2.0f) / a0; // b2
-    c[3] =  (-2.0f * cs)          / a0; // a1
-    c[4] =   (1.0f - alpha)       / a0; // a2
-}
+// Feature switches: set to 1 to enable the peripheral.
+#define FEATURE_OLED_ENABLED 0
+#define FEATURE_ROTARY_ENCODER_ENABLED 0
 
-void dsp_gen_hpf(float *c, float f, float q) {
-    float w  = 2.0f * M_PI * f;
-    float cs = cosf(w), sn = sinf(w);
-    float alpha = sn / (2.0f * q);
-    float a0    = 1.0f + alpha;
-    c[0] =  ((1.0f + cs) / 2.0f) / a0; // b0
-    c[1] = -((1.0f + cs))         / a0; // b1
-    c[2] =  ((1.0f + cs) / 2.0f) / a0; // b2
-    c[3] =  (-2.0f * cs)          / a0; // a1
-    c[4] =   (1.0f - alpha)       / a0; // a2
-}
-
-void dsp_biquad(float *in, float *out, int len, float *c, float *w) {
-    for (int i = 0; i < len; i++) {
-        float d = in[i] - c[3] * w[0] - c[4] * w[1];
-        out[i]  = c[0] * d  + c[1] * w[0] + c[2] * w[1];
-        w[1]    = w[0];
-        w[0]    = d;
-    }
-}
-
+// GPIO assignments
 #define BTLED 2
 #define ENC_CLK 32
 #define ENC_DT  33
 #define ENC_SW  27
+// #define OLED_SCL_PIN 19
+#define OLED_SDA_PIN 21
+#define I2S_BCK_PIN 25
+#define I2S_WS_PIN 26
+#define I2S_DATA_OUT_PIN 19
 
-// DAC Jatah Pin
+// DAC and amplifier control pins
 #define XSMT_PIN 23  // GPIO23 → XSMT PCM5102A
-// AMPLI jatah Pin
-#define PAM_M_PIN 17 // GPIO23 -> PAM MUTE
+#define PAM_M_PIN 17 // GPIO17 -> PAM MUTE
 
 void dac_mute() {
   digitalWrite(XSMT_PIN, LOW);
@@ -71,38 +51,40 @@ Preferences prefs;
 // ─── I2S PIN CONFIG ───────────────────────────────────────────
 i2s_pin_config_t pin_config = {
     .mck_io_num = I2S_PIN_NO_CHANGE,
-    .bck_io_num = 25,
-    .ws_io_num = 26,
-    .data_out_num = 22,
+    .bck_io_num = I2S_BCK_PIN,
+    .ws_io_num = I2S_WS_PIN,
+    .data_out_num = I2S_DATA_OUT_PIN,
     .data_in_num = I2S_PIN_NO_CHANGE};
+
+static inline void set_i2s_stereo_frame(int16_t *frame, int16_t left, int16_t right)
+{
+  frame[0] = left;
+  frame[1] = right;
+}
 
 // ─── I2S DRIVER CONFIG ────────────────────────────────────────
 i2s_config_t i2s_config_stereo = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = 44100,
+    .sample_rate = (int)dsp::kDefaultSampleRate,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
     .intr_alloc_flags = 0,
-    .dma_buf_count = 16,
+    .dma_buf_count = 8,
     .dma_buf_len = 512,
     .use_apll = false,
     .tx_desc_auto_clear = true,
     .fixed_mclk = 0};
 
-// ─── DSP CROSSOVER CONFIG ─────────────────────────────────────
-// Crossover point & Q factor (Linkwitz-Riley = cascade 2x Butterworth Q=0.7071)
-float crossover_freq = 5000.0f; // Hz, bisa diubah via Serial
-const float SAMPLE_RATE = 44100.0f;
-const float Q_BUTTERWORTH = 0.7071f;
-
-// Koefisien filter [b0, b1, b2, a1, a2]
-float coeffs_lpf1[5], coeffs_lpf2[5]; // LPF stage 1 & 2 → Woofer
-float coeffs_hpf1[5], coeffs_hpf2[5]; // HPF stage 1 & 2 → Tweeter
-
-// Delay line (state) tiap filter — wajib dipisah
-float w_lpf1[2] = {0}, w_lpf2[2] = {0};
-float w_hpf1[2] = {0}, w_hpf2[2] = {0};
+// Independent filter state prevents WAV chimes from disturbing BT playback.
+float crossover_freq = 5000.0f;
+float bass_shelf_freq = dsp::kDefaultBassShelfFrequencyHz;
+float bass_shelf_gain_db = dsp::kDefaultBassShelfGainDb;
+float bass_high_pass_freq = dsp::kDefaultBassHighPassHz;
+float punch_freq = dsp::kDefaultPunchFrequencyHz;
+float punch_gain_db = dsp::kDefaultPunchGainDb;
+dsp::Crossover stream_crossover;
+dsp::Crossover chime_crossover;
 
 // Gain woofer & tweeter (1.0 = normal)
 float gain_woofer = 1.0f;
@@ -112,7 +94,16 @@ bool mono_mode = true; // true = mono mix, false = stereo passthrough (LPF ke L,
 
 // ─── UI STATE MACHINE ─────────────────────────────────────────
 enum UIState  { IDLE, NAVIGATE, EDIT };
-enum UIParam  { PARAM_FREQ, PARAM_GAIN_W, PARAM_GAIN_T, PARAM_WAV_VOL, PARAM_MODE, PARAM_COUNT };
+enum UIParam {
+  PARAM_FREQ,
+  PARAM_GAIN_W,
+  PARAM_GAIN_T,
+  PARAM_WAV_VOL,
+  PARAM_MODE,
+  PARAM_BASS_FREQ,
+  PARAM_BASS_DB,
+  PARAM_COUNT
+};
 enum UIPage {
   PAGE_NOWPLAY,
   PAGE_CONFIG,
@@ -167,121 +158,246 @@ unsigned long scroll_pause_start = 0;
 const int SCROLL_PAUSE_MS = 2000;
 // ==============================================================
 
-// Fungsi hitung ulang koefisien (dipanggil saat freq berubah)
-void update_crossover(float freq_hz) {
-  // ESP-DSP pakai normalized frequency: f / fs, range 0.0 - 0.5
-  float f_norm = freq_hz / SAMPLE_RATE;
-  dsp_gen_lpf(coeffs_lpf1, f_norm, Q_BUTTERWORTH);
-  dsp_gen_lpf(coeffs_lpf2, f_norm, Q_BUTTERWORTH);
-  dsp_gen_hpf(coeffs_hpf1, f_norm, Q_BUTTERWORTH);
-  dsp_gen_hpf(coeffs_hpf2, f_norm, Q_BUTTERWORTH);
-  // Reset delay line saat koefisien berubah
-  memset(w_lpf1, 0, sizeof(w_lpf1));
-  memset(w_lpf2, 0, sizeof(w_lpf2));
-  memset(w_hpf1, 0, sizeof(w_hpf1));
-  memset(w_hpf2, 0, sizeof(w_hpf2));
-  Serial.printf("Crossover updated: %.0f Hz\n", freq_hz);
+// Update both independent filter paths with the same settings.
+bool update_crossover(float freq_hz, float shelf_freq_hz, float shelf_gain_db) {
+  if (!stream_crossover.configure(dsp::kDefaultSampleRate, freq_hz,
+                                  shelf_freq_hz, shelf_gain_db) ||
+      !chime_crossover.configure(dsp::kDefaultSampleRate, freq_hz,
+                                 shelf_freq_hz, shelf_gain_db)) {
+    return false;
+  }
+  return true;
+}
+
+bool update_punch(float high_pass_hz, float frequency_hz, float gain_db) {
+  return stream_crossover.configurePunch(dsp::kDefaultSampleRate, high_pass_hz,
+                                         frequency_hz, gain_db) &&
+         chime_crossover.configurePunch(dsp::kDefaultSampleRate, high_pass_hz,
+                                        frequency_hz, gain_db);
+}
+
+// Preset bass: mengisi semua parameter sekaligus.
+struct BassPreset {
+  const char *name;
+  float high_pass_hz;
+  float punch_db;
+  float shelf_db;
+};
+static const BassPreset BASS_PRESETS[] = {
+    {"punch", dsp::kDefaultBassHighPassHz, dsp::kDefaultPunchGainDb, dsp::kDefaultBassShelfGainDb},
+    {"soft", 45.0f, 2.0f, 1.0f},
+    {"flat", dsp::kMinBassHighPassHz, 0.0f, 0.0f},
+};
+
+bool apply_bass_preset(const String &name) {
+  for (const BassPreset &preset : BASS_PRESETS) {
+    if (name != preset.name) {
+      continue;
+    }
+    bass_high_pass_freq = preset.high_pass_hz;
+    punch_freq = dsp::kDefaultPunchFrequencyHz;
+    punch_gain_db = preset.punch_db;
+    bass_shelf_freq = dsp::kDefaultBassShelfFrequencyHz;
+    bass_shelf_gain_db = preset.shelf_db;
+    return update_crossover(crossover_freq, bass_shelf_freq, bass_shelf_gain_db) &&
+           update_punch(bass_high_pass_freq, punch_freq, punch_gain_db);
+  }
+  return false;
 }
 
 // ─── LITTLEFS / WAV CHIME ─────────────────────────────────────
-static char wav_to_play[32] = "";
+// Chime dan stream BT memakai I2S_NUM_0 yang sama. Selama wav_pending > 0 audio
+// BT dibuang, jadi hanya satu sumber yang menulis ke I2S. Semua chime diputar
+// bergantian oleh satu task lewat wav_queue.
+struct WavRequest {
+  char path[32];
+};
+static QueueHandle_t wav_queue = nullptr;
+static std::atomic<int> wav_pending{0};
 float wav_volume = 0.7f;
-volatile bool startup_done = false;
 bool was_connected = false;
 bool reconnect_window_open = true;
 
 bool is_startup = true;  // true sampai window reconnect selesai
 bool ever_connected = false; // true kalau pernah konek sejak startup
 
-void wav_task(void *param)
+// Memutar WAV lewat crossover. keep_looping != nullptr: putar berulang selama
+// *keep_looping bernilai true. Return false kalau file tidak ada/format salah.
+static bool play_wav_file(const char *path, float gain, dsp::Crossover &crossover,
+                          const volatile bool *keep_looping = nullptr)
 {
-  if (strlen(wav_to_play) > 0)
+  File file = LittleFS.open(path, "r");
+  WavInfo info;
+  if (!file || !read_wav_header(file, info))
   {
-    File file = LittleFS.open(wav_to_play, "r");
+    Serial.printf("WAV tidak ada atau format salah: %s\n", path);
     if (file)
-    {
-      file.seek(44); // skip WAV header
-
-      const size_t READ_SAMPLES = 128;
-      uint8_t  raw[READ_SAMPLES * 2];       // 256 bytes
-      static float   fbuf[READ_SAMPLES];
-      static float   flpf[READ_SAMPLES],  flpf2[READ_SAMPLES];
-      static float   fhpf[READ_SAMPLES],  fhpf2[READ_SAMPLES];
-      static int16_t out[READ_SAMPLES * 2]; // stereo output
-
-      size_t bytes_written;
-
-      while (file.available())
-      {
-        size_t bytes_read  = file.read(raw, sizeof(raw));
-          // Dibagi 4 karena 1 sampel stereo = 4 byte (16-bit L + 16-bit R)
-          size_t num_samples = bytes_read / 4; 
-
-          // Convert ke float + apply volume (Mix Stereo ke Mono)
-          for (size_t i = 0; i < num_samples; i++) {
-            int16_t left  = (raw[i*4+1] << 8) | raw[i*4];
-            int16_t right = (raw[i*4+3] << 8) | raw[i*4+2];
-            
-            // Gabungkan kiri dan kanan lalu bagi 2 untuk dijadikan mono
-            fbuf[i] = (float)((left + right) / 2.0f) * wav_volume; 
-          }
-
-        if (mono_mode) {
-          // Apply crossover
-          dsp_biquad(fbuf,  flpf,  num_samples, coeffs_lpf1, w_lpf1);
-          dsp_biquad(flpf,  flpf2, num_samples, coeffs_lpf2, w_lpf2);
-          dsp_biquad(fbuf,  fhpf,  num_samples, coeffs_hpf1, w_hpf1);
-          dsp_biquad(fhpf,  fhpf2, num_samples, coeffs_hpf2, w_hpf2);
-
-          for (size_t i = 0; i < num_samples; i++) {
-            out[i*2]   = (int16_t)constrain(fhpf2[i] * gain_tweeter, -32768, 32767); // R → Tweeter
-            out[i*2+1] = (int16_t)constrain(flpf2[i] * gain_woofer,  -32768, 32767); // L → Woofer
-          }
-        } else {
-          // Stereo passthrough
-          for (size_t i = 0; i < num_samples; i++) {
-            out[i*2]   = (int16_t)constrain(fbuf[i], -32768, 32767);
-            out[i*2+1] = (int16_t)constrain(fbuf[i], -32768, 32767);
-          }
-        }
-
-        i2s_write(I2S_NUM_0, out, num_samples * 4, &bytes_written, portMAX_DELAY);
-      }
       file.close();
+    return false;
+  }
+
+  const size_t FRAMES = 128;
+  const size_t frame_bytes = info.channels * 2;
+  uint8_t raw[FRAMES * 4];
+  float fbuf[FRAMES];
+  int16_t out[FRAMES * 2];
+  size_t bytes_written;
+  uint32_t remaining = info.data_size;
+
+  // Suara contoh: fade-in saat mulai dan fade-out saat dihentikan, supaya tidak
+  // berdecak. Chime biasa diputar apa adanya.
+  const bool looping = keep_looping != nullptr;
+  const float FADE_IN_STEP = 1.0f / (0.5f * dsp::kDefaultSampleRate);
+  const float FADE_OUT_STEP = 1.0f / (0.15f * dsp::kDefaultSampleRate);
+  float fade = looping ? 0.0f : 1.0f;
+  bool stopping = false;
+
+  for (;;)
+  {
+    if (looping && !*keep_looping)
+      stopping = true;
+    if (stopping && fade <= 0.0f)
+      break;
+    if (remaining < frame_bytes)
+    {
+      // Selesai, atau ulangi dari awal data untuk suara contoh.
+      if (keep_looping == nullptr || info.data_size < frame_bytes ||
+          !file.seek(info.data_start))
+        break;
+      remaining = info.data_size;
+    }
+
+    size_t want = min((size_t)remaining, FRAMES * frame_bytes);
+    want -= want % frame_bytes;
+    size_t got = file.read(raw, want);
+    got -= got % frame_bytes;
+    if (got == 0)
+      break;
+    remaining -= got;
+    const size_t frames = got / frame_bytes;
+
+    // Mono mix: stereo digabung, mono dipakai apa adanya.
+    for (size_t i = 0; i < frames; i++)
+    {
+      const uint8_t *p = &raw[i * frame_bytes];
+      const int16_t left = (int16_t)(p[0] | (p[1] << 8));
+      const int16_t right = info.channels == 2 ? (int16_t)(p[2] | (p[3] << 8)) : left;
+      if (looping)
+        fade = stopping ? max(fade - FADE_OUT_STEP, 0.0f)
+                        : min(fade + FADE_IN_STEP, 1.0f);
+      fbuf[i] = ((float)left + (float)right) * 0.5f * gain * fade;
+    }
+
+    if (mono_mode)
+    {
+      for (size_t i = 0; i < frames; i++)
+      {
+        float woofer, tweeter;
+        crossover.processSample(fbuf[i], gain_woofer, gain_tweeter, woofer, tweeter);
+        const int16_t left = (int16_t)constrain(woofer, -32768.0f, 32767.0f);
+        const int16_t right = (int16_t)constrain(tweeter, -32768.0f, 32767.0f);
+        set_i2s_stereo_frame(&out[i * 2], left, right);
+      }
     }
     else
     {
-      Serial.printf("Gagal buka: %s\n", wav_to_play);
+      // Stereo passthrough
+      for (size_t i = 0; i < frames; i++)
+      {
+        const int16_t sample = (int16_t)constrain(fbuf[i], -32768.0f, 32767.0f);
+        set_i2s_stereo_frame(&out[i * 2], sample, sample);
+      }
     }
-    wav_to_play[0] = '\0';
-  }
 
-  // Mute kembali setelah WAV selesai
-  // Hanya mute kalau BT tidak sedang streaming
-  if (!a2dp_sink.is_connected()) {
-    dac_mute();
+    i2s_write(I2S_NUM_0, out, frames * 4, &bytes_written, portMAX_DELAY);
   }
-  
-  startup_done = true;
-  vTaskDelete(NULL);
+  file.close();
+
+  if (looping)
+  {
+    // Isi seluruh buffer DMA dengan hening supaya fade-out selesai terdengar
+    // sebelum DAC di-mute.
+    memset(out, 0, sizeof(out));
+    const int dma_frames = i2s_config_stereo.dma_buf_count * i2s_config_stereo.dma_buf_len;
+    for (int written = 0; written < dma_frames; written += FRAMES)
+      i2s_write(I2S_NUM_0, out, sizeof(out), &bytes_written, portMAX_DELAY);
+  }
+  return true;
+}
+
+void wav_task(void *param)
+{
+  WavRequest request;
+  for (;;)
+  {
+    xQueueReceive(wav_queue, &request, portMAX_DELAY);
+    dac_unmute(); // ← unmute sebelum play
+    play_wav_file(request.path, wav_volume, chime_crossover);
+
+    // Mute kembali setelah antrean WAV habis
+    // Hanya mute kalau BT tidak sedang tersambung
+    if (wav_pending.fetch_sub(1) == 1 && !a2dp_sink.is_connected()) {
+      dac_mute();
+    }
+  }
 }
 
 void play_wav(const char *filename)
 {
-  dac_unmute(); // ← unmute sebelum play
-  strncpy(wav_to_play, filename, sizeof(wav_to_play));
-  xTaskCreate(wav_task, "wav_task", 8192, NULL, 1, NULL);
+  WavRequest request;
+  strlcpy(request.path, filename, sizeof(request.path));
+
+  // Naikkan sebelum masuk antrean supaya audio BT langsung berhenti.
+  wav_pending++;
+  if (xQueueSend(wav_queue, &request, 0) != pdTRUE) {
+    wav_pending--;
+    Serial.printf("Antrean WAV penuh: %s\n", filename);
+  }
+}
+
+static void wait_for_wav()
+{
+  while (wav_pending.load() > 0) {
+    web_control::loop();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ─── SUARA CONTOH (MODE SETTING) ──────────────────────────────
+// Diputar berulang lewat crossover musik supaya perubahan setting langsung terdengar.
+static const char SAMPLE_PATH[] = "/sample.wav";
+static volatile bool sample_enabled = false;
+static bool sample_available = false;
+
+void sample_task(void *param)
+{
+  for (;;)
+  {
+    if (!sample_enabled)
+    {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    dac_unmute();
+    if (!play_wav_file(SAMPLE_PATH, 1.0f, stream_crossover, &sample_enabled))
+    {
+      sample_enabled = false;
+    }
+    dac_mute();
+  }
 }
 
 // Bris program untuk LCD
 // SSD1306 128x32 I2C
 // Parameter: rotasi, reset pin, SCL, SDA
+#if FEATURE_OLED_ENABLED
 U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(
   U8G2_R2,        // [U8G2_R2](rotasi 180°)||[U8G2_R0](rotasi normal)
   U8X8_PIN_NONE,  // tidak pakai pin reset
-  19,             // SCL
-  21              // SDA
+  OLED_SCL_PIN,
+  OLED_SDA_PIN
 );
+#endif
 
 // Format millisecond ke MM:SS
 void format_time(char *buf, uint32_t ms)
@@ -293,6 +409,7 @@ void format_time(char *buf, uint32_t ms)
 }
 
 // Scroll teks otomatis
+#if FEATURE_OLED_ENABLED
 int get_scroll_offset(const char *text, int max_width, int &scroll_x)
 {
   int text_width = u8g2.getStrWidth(text);
@@ -323,13 +440,16 @@ int get_scroll_offset(const char *text, int max_width, int &scroll_x)
   }
   return scroll_x;
 }
+#endif
 
 // Panggil fungsi ini setiap kali ada perubahan status
 // Label parameter
-const char* param_labels[] = { "Freq", "GainW", "GainT", "WVol", "Mode" };
+const char* param_labels[] = {
+    "Freq", "GainW", "GainT", "WVol", "Mode", "BassHz", "BassDB"};
 
 void update_display()
 {
+#if FEATURE_OLED_ENABLED
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tr);
 
@@ -344,21 +464,25 @@ void update_display()
                (int)crossover_freq, mono_mode ? "XO" : "ST");
       u8g2.drawStr(0, 22, line2);
       char line3[32];
-      snprintf(line3, sizeof(line3), "W:%.1f T:%.1f V:%d%%",
-               gain_woofer, gain_tweeter, (int)(wav_volume * 100));
+      snprintf(line3, sizeof(line3), "Bass:%+.1fdB@%.0fHz",
+               bass_shelf_gain_db, bass_shelf_freq);
       u8g2.drawStr(0, 32, line3);
     }
     else
     {
       // NAVIGATE / EDIT — kode yang sudah ada
       const char *param_names[PARAM_COUNT] = {
-          "Freq", "Gain W", "Gain T", "WAV Vol", "Mode"};
+          "Freq", "Gain W", "Gain T", "WAV Vol", "Mode", "Bass Hz", "Bass dB"};
       char param_values[PARAM_COUNT][16];
       snprintf(param_values[PARAM_FREQ], sizeof(param_values[0]), "%dHz", (int)crossover_freq);
       snprintf(param_values[PARAM_GAIN_W], sizeof(param_values[1]), "%.1f", gain_woofer);
       snprintf(param_values[PARAM_GAIN_T], sizeof(param_values[2]), "%.1f", gain_tweeter);
       snprintf(param_values[PARAM_WAV_VOL], sizeof(param_values[3]), "%d%%", (int)(wav_volume * 100));
       snprintf(param_values[PARAM_MODE], sizeof(param_values[4]), mono_mode ? "XO" : "ST");
+      snprintf(param_values[PARAM_BASS_FREQ], sizeof(param_values[PARAM_BASS_FREQ]),
+               "%.0fHz", bass_shelf_freq);
+      snprintf(param_values[PARAM_BASS_DB], sizeof(param_values[PARAM_BASS_DB]),
+               "%.1fdB", bass_shelf_gain_db);
 
       int start = (selected_param > 1) ? selected_param - 1 : 0;
       if (start + 3 > PARAM_COUNT)
@@ -485,10 +609,27 @@ void update_display()
   }
 
   u8g2.sendBuffer();
+#endif
 }
 // ============
 
 // =================Fungsi simpan & load settings================
+// Nilai setting dalam format JSON, dipakai halaman web dan deteksi perubahan.
+static String settings_values()
+{
+  char values[256];
+  snprintf(values, sizeof(values),
+           "\"mono\":%s,\"freq\":%.0f,\"gain_w\":%.2f,\"gain_t\":%.2f,"
+           "\"wav_vol\":%.2f,\"bass_hz\":%.1f,\"bass_db\":%.1f,"
+           "\"hpf_hz\":%.1f,\"punch_hz\":%.1f,\"punch_db\":%.1f",
+           mono_mode ? "true" : "false", crossover_freq, gain_woofer,
+           gain_tweeter, wav_volume, bass_shelf_freq, bass_shelf_gain_db,
+           bass_high_pass_freq, punch_freq, punch_gain_db);
+  return values;
+}
+
+static String saved_values;  // Setting yang sama dengan isi NVS
+
 void save_settings()
 {
   prefs.begin("speaker", false); // namespace "speaker", mode read-write
@@ -497,8 +638,30 @@ void save_settings()
   prefs.putFloat("gain_w", gain_woofer);
   prefs.putFloat("gain_t", gain_tweeter);
   prefs.putFloat("wav_vol", wav_volume);
+  prefs.putFloat("bass_hz", bass_shelf_freq);
+  prefs.putFloat("bass_db", bass_shelf_gain_db);
+  prefs.putFloat("hpf_hz", bass_high_pass_freq);
+  prefs.putFloat("punch_hz", punch_freq);
+  prefs.putFloat("punch_db", punch_gain_db);
   prefs.end();
+  saved_values = settings_values();
   Serial.println("Settings tersimpan!");
+}
+
+bool parse_float_value(String text, float &value)
+{
+  text.trim();
+  if (text.length() == 0)
+    return false;
+
+  const char *input = text.c_str();
+  char *end = nullptr;
+  const float parsed = strtof(input, &end);
+  if (end == input || *end != '\0' || !isfinite(parsed))
+    return false;
+
+  value = parsed;
+  return true;
 }
 // ============================================================
 
@@ -557,9 +720,13 @@ void handle_encoder()
       switch (selected_param)
       {
       case PARAM_FREQ:
-        crossover_freq = constrain(crossover_freq + (cw ? 100 : -100), 100, 20000);
-        update_crossover(crossover_freq);
+      {
+        const float candidate = constrain(crossover_freq + (cw ? 100 : -100), 100, 20000);
+        if (update_crossover(candidate, bass_shelf_freq, bass_shelf_gain_db)) {
+          crossover_freq = candidate;
+        }
         break;
+      }
       case PARAM_GAIN_W:
         gain_woofer = constrain(gain_woofer + (cw ? 0.1f : -0.1f), 0.0f, 2.0f);
         break;
@@ -572,6 +739,26 @@ void handle_encoder()
       case PARAM_MODE:
         mono_mode = !mono_mode;
         break;
+      case PARAM_BASS_FREQ:
+      {
+        const float candidate = constrain(
+            bass_shelf_freq + (cw ? 5.0f : -5.0f),
+            dsp::kMinBassShelfFrequencyHz, dsp::kMaxBassShelfFrequencyHz);
+        if (update_crossover(crossover_freq, candidate, bass_shelf_gain_db)) {
+          bass_shelf_freq = candidate;
+        }
+        break;
+      }
+      case PARAM_BASS_DB:
+      {
+        const float candidate = constrain(
+            bass_shelf_gain_db + (cw ? 0.5f : -0.5f),
+            dsp::kMinBassShelfGainDb, dsp::kMaxBassShelfGainDb);
+        if (update_crossover(crossover_freq, bass_shelf_freq, candidate)) {
+          bass_shelf_gain_db = candidate;
+        }
+        break;
+      }
       default:
         break;
       }
@@ -636,6 +823,22 @@ void handle_encoder()
   sw_last = sw_val;
 }
 
+void initialize_gpio()
+{
+  pinMode(BTLED, OUTPUT);
+  pinMode(XSMT_PIN, OUTPUT);
+  pinMode(PAM_M_PIN, OUTPUT);
+
+  digitalWrite(XSMT_PIN, LOW);
+  digitalWrite(PAM_M_PIN, HIGH);
+
+#if FEATURE_ROTARY_ENCODER_ENABLED
+  pinMode(ENC_CLK, INPUT_PULLUP);
+  pinMode(ENC_DT, INPUT_PULLUP);
+  pinMode(ENC_SW, INPUT_PULLUP);
+#endif
+}
+
 void handle_timeout()
 {
   // Timeout CONFIG
@@ -698,15 +901,25 @@ void bt_connection_state_changed(esp_a2d_connection_state_t state, void *ptr)
 }
 
 // ─── AUDIO CALLBACK (DSP CROSSOVER) ──────────────────────────
-// Buffer float untuk ESP-DSP (proses per batch)
-// Buffer DSP — global, fixed size
-static float buf_mono[1024];
-static float buf_lpf[1024],  buf_lpf2[1024];
-static float buf_hpf[1024],  buf_hpf2[1024];
+// Fade-in 20 ms saat musik kembali setelah chime, supaya tidak ada bunyi klik.
+static float stream_gain = 1.0f;
+static constexpr float STREAM_FADE_STEP = 1.0f / (0.02f * dsp::kDefaultSampleRate);
+
+static inline float next_stream_gain()
+{
+  stream_gain = min(stream_gain + STREAM_FADE_STEP, 1.0f);
+  return stream_gain;
+}
 
 // change 8bit format to 16bit format, easier to process later
 void audio_data_callback(const uint8_t *data, uint32_t len)
 {
+  // Chime sedang diputar: buang audio BT agar tidak tercampur di I2S.
+  if (wav_pending.load() > 0) {
+    stream_gain = 0.0f;
+    return;
+  }
+
   // Unmute DAC saat ada audio
   static bool is_unmuted = false;
   if (!is_unmuted) {
@@ -715,7 +928,6 @@ void audio_data_callback(const uint8_t *data, uint32_t len)
   }
 
   if (mono_mode) {
-    // DSP crossover
     size_t num_samples = len / 4;
     int16_t i2s_data[num_samples * 2];
 
@@ -724,23 +936,14 @@ void audio_data_callback(const uint8_t *data, uint32_t len)
       int16_t left = (data[i * 4 + 1] << 8) | data[i * 4];
       int16_t right = (data[i * 4 + 3] << 8) | data[i * 4 + 2];
 
-      // Mono mix
-      buf_mono[i] = (float)(left + right) / 2.0f;
-    }
+      const float mono = ((float)left + (float)right) * 0.5f * next_stream_gain();
+      float woofer, tweeter;
+      stream_crossover.processSample(mono, gain_woofer, gain_tweeter,
+                                     woofer, tweeter);
 
-    dsp_biquad(buf_mono, buf_lpf,  num_samples, coeffs_lpf1, w_lpf1);
-    dsp_biquad(buf_lpf,  buf_lpf2, num_samples, coeffs_lpf2, w_lpf2);
-    dsp_biquad(buf_mono, buf_hpf,  num_samples, coeffs_hpf1, w_hpf1);
-    dsp_biquad(buf_hpf,  buf_hpf2, num_samples, coeffs_hpf2, w_hpf2);
-
-    // ── Bagian Mono Mode (Crossover) ──
-    // Hardware meminta R di index genap dan L di index ganjil
-    // Masalah: Ketika mengganti file wav, kadang L dan R terbalik
-    for (size_t i = 0; i < num_samples; i++) {
-      i2s_data[i * 2]     = (int16_t)constrain(buf_hpf2[i] * gain_tweeter, -32768, 32767); // R -> Tweeter (Kanan)
-      i2s_data[i * 2 + 1] = (int16_t)constrain(buf_lpf2[i] * gain_woofer,  -32768, 32767); // L -> Woofer (Kiri)
-      // i2s_data[i * 2]     = (int16_t)constrain(buf_lpf2[i] * gain_woofer,  -32768, 32767); // L -> Woofer
-      // i2s_data[i * 2 + 1] = (int16_t)constrain(buf_hpf2[i] * gain_tweeter, -32768, 32767); // R -> Tweeter
+      const int16_t left_out = (int16_t)constrain(woofer, -32768.0f, 32767.0f);
+      const int16_t right_out = (int16_t)constrain(tweeter, -32768.0f, 32767.0f);
+      set_i2s_stereo_frame(&i2s_data[i * 2], left_out, right_out);
     }
 
     size_t i2s_bytes_written;
@@ -755,10 +958,8 @@ void audio_data_callback(const uint8_t *data, uint32_t len)
       int16_t left = (data[i * 4 + 1] << 8) | data[i * 4];      
       int16_t right = (data[i * 4 + 3] << 8) | data[i * 4 + 2]; 
 
-      // ── Bagian Stereo ──
-      // Sesuaikan juga dengan hardware: R di genap, L di ganjil
-      i2s_data[i * 2]     = right;
-      i2s_data[i * 2 + 1] = left;
+      const float gain = next_stream_gain();
+      set_i2s_stereo_frame(&i2s_data[i * 2], (int16_t)(left * gain), (int16_t)(right * gain));
     }
     size_t i2s_bytes_written;
     i2s_write(I2S_NUM_0, i2s_data, sizeof(i2s_data), &i2s_bytes_written, portMAX_DELAY); 
@@ -773,13 +974,43 @@ void load_settings()
   gain_woofer = prefs.getFloat("gain_w", 1.0f);     // default 1.0
   gain_tweeter = prefs.getFloat("gain_t", 1.0f);    // default 1.0
   wav_volume = prefs.getFloat("wav_vol", 0.7f);     // default 0.7
+  bass_shelf_freq = prefs.getFloat(
+      "bass_hz", dsp::kDefaultBassShelfFrequencyHz);
+  bass_shelf_gain_db = prefs.getFloat(
+      "bass_db", dsp::kDefaultBassShelfGainDb);
+  bass_high_pass_freq = prefs.getFloat("hpf_hz", dsp::kDefaultBassHighPassHz);
+  punch_freq = prefs.getFloat("punch_hz", dsp::kDefaultPunchFrequencyHz);
+  punch_gain_db = prefs.getFloat("punch_db", dsp::kDefaultPunchGainDb);
   prefs.end();
-  Serial.printf("Settings loaded → freq:%.0f gain_w:%.2f gain_t:%.2f wav_vol:%.2f\n",
-                crossover_freq, gain_woofer, gain_tweeter, wav_volume);
+
+  if (!isfinite(bass_shelf_freq) ||
+      bass_shelf_freq < dsp::kMinBassShelfFrequencyHz ||
+      bass_shelf_freq > dsp::kMaxBassShelfFrequencyHz) {
+    bass_shelf_freq = dsp::kDefaultBassShelfFrequencyHz;
+  }
+  if (!isfinite(bass_shelf_gain_db) ||
+      bass_shelf_gain_db < dsp::kMinBassShelfGainDb ||
+      bass_shelf_gain_db > dsp::kMaxBassShelfGainDb) {
+    bass_shelf_gain_db = dsp::kDefaultBassShelfGainDb;
+  }
+  if (!update_punch(bass_high_pass_freq, punch_freq, punch_gain_db)) {
+    bass_high_pass_freq = dsp::kDefaultBassHighPassHz;
+    punch_freq = dsp::kDefaultPunchFrequencyHz;
+    punch_gain_db = dsp::kDefaultPunchGainDb;
+    update_punch(bass_high_pass_freq, punch_freq, punch_gain_db);
+  }
+
+  saved_values = settings_values();
+
+  Serial.printf("Settings loaded -> freq:%.0f gain_w:%.2f gain_t:%.2f wav_vol:%.2f bass:%.0fHz/%+.1fdB\n",
+                crossover_freq, gain_woofer, gain_tweeter, wav_volume,
+                bass_shelf_freq, bass_shelf_gain_db);
   update_display();
 }
 
 // ─── SERIAL CONTROLLER ────────────────────────────────────────
+void handle_command(const String &cmd);
+
 void handle_serial()
 {
   if (!Serial.available())
@@ -787,7 +1018,25 @@ void handle_serial()
 
   String cmd = Serial.readStringUntil('\n');
   cmd.trim();
+  handle_command(cmd);
+}
 
+String settings_json()
+{
+  const String values = settings_values();
+  char extra[128];
+  snprintf(extra, sizeof(extra),
+           ",\"dirty\":%s,\"exit_in\":%ld,\"sample_ok\":%s,\"sample_on\":%s}",
+           values != saved_values ? "true" : "false",
+           (long)web_control::exit_countdown_ms(),
+           sample_available ? "true" : "false",
+           sample_enabled ? "true" : "false");
+  return "{" + values + extra;
+}
+
+// Dipakai bersama oleh Serial dan halaman web.
+void handle_command(const String &cmd)
+{
   if (cmd.startsWith("mono:"))
   {
     String val = cmd.substring(5);
@@ -810,11 +1059,13 @@ void handle_serial()
   }
   else if (cmd.startsWith("freq:"))
   {
-    float freq = cmd.substring(5).toFloat();
-    if (freq > 100 && freq < 20000)
+    float freq;
+    if (parse_float_value(cmd.substring(5), freq) &&
+        freq > 100 && freq < 20000 &&
+        update_crossover(freq, bass_shelf_freq, bass_shelf_gain_db))
     {
       crossover_freq = freq;
-      update_crossover(crossover_freq);
+      Serial.printf("Crossover updated: %.0f Hz\n", crossover_freq);
       update_display();
     }
     else
@@ -822,17 +1073,127 @@ void handle_serial()
       Serial.println("Freq harus antara 100 - 20000 Hz");
     }
   }
+  else if (cmd.startsWith("bass_hz:"))
+  {
+    float freq;
+    if (parse_float_value(cmd.substring(8), freq) &&
+        freq >= dsp::kMinBassShelfFrequencyHz &&
+        freq <= dsp::kMaxBassShelfFrequencyHz &&
+        update_crossover(crossover_freq, freq, bass_shelf_gain_db))
+    {
+      bass_shelf_freq = freq;
+      Serial.printf("Bass shelf frequency: %.1f Hz\n", bass_shelf_freq);
+      update_display();
+    }
+    else
+    {
+      Serial.printf("Bass shelf frequency must be %.0f-%.0f Hz\n",
+                    dsp::kMinBassShelfFrequencyHz,
+                    dsp::kMaxBassShelfFrequencyHz);
+    }
+  }
+  else if (cmd.startsWith("bass_db:"))
+  {
+    float gain_db;
+    if (parse_float_value(cmd.substring(8), gain_db) &&
+        gain_db >= dsp::kMinBassShelfGainDb &&
+        gain_db <= dsp::kMaxBassShelfGainDb &&
+        update_crossover(crossover_freq, bass_shelf_freq, gain_db))
+    {
+      bass_shelf_gain_db = gain_db;
+      Serial.printf("Bass shelf gain: %+.1f dB\n", bass_shelf_gain_db);
+      update_display();
+    }
+    else
+    {
+      Serial.printf("Bass shelf gain must be %.0f to %+.0f dB\n",
+                    dsp::kMinBassShelfGainDb, dsp::kMaxBassShelfGainDb);
+    }
+  }
+  else if (cmd.startsWith("bass:"))
+  {
+    if (apply_bass_preset(cmd.substring(5)))
+    {
+      Serial.printf("Preset bass: %s\n", cmd.substring(5).c_str());
+      update_display();
+    }
+    else
+    {
+      Serial.println("Preset bass: punch, soft, atau flat");
+    }
+  }
+  else if (cmd.startsWith("hpf_hz:"))
+  {
+    float freq;
+    if (parse_float_value(cmd.substring(7), freq) &&
+        update_punch(freq, punch_freq, punch_gain_db))
+    {
+      bass_high_pass_freq = freq;
+      Serial.printf("Bass high-pass: %.1f Hz\n", bass_high_pass_freq);
+    }
+    else
+    {
+      Serial.printf("High-pass harus %.0f-%.0f Hz\n",
+                    dsp::kMinBassHighPassHz, dsp::kMaxBassHighPassHz);
+    }
+  }
+  else if (cmd.startsWith("punch_hz:"))
+  {
+    float freq;
+    if (parse_float_value(cmd.substring(9), freq) &&
+        update_punch(bass_high_pass_freq, freq, punch_gain_db))
+    {
+      punch_freq = freq;
+      Serial.printf("Punch frequency: %.1f Hz\n", punch_freq);
+    }
+    else
+    {
+      Serial.printf("Punch frequency harus %.0f-%.0f Hz\n",
+                    dsp::kMinPunchFrequencyHz, dsp::kMaxPunchFrequencyHz);
+    }
+  }
+  else if (cmd.startsWith("punch_db:"))
+  {
+    float gain_db;
+    if (parse_float_value(cmd.substring(9), gain_db) &&
+        update_punch(bass_high_pass_freq, punch_freq, gain_db))
+    {
+      punch_gain_db = gain_db;
+      Serial.printf("Punch gain: %+.1f dB\n", punch_gain_db);
+    }
+    else
+    {
+      Serial.printf("Punch gain harus %.0f sampai %+.0f dB\n",
+                    dsp::kMinPunchGainDb, dsp::kMaxPunchGainDb);
+    }
+  }
   else if (cmd.startsWith("gain_w:"))
   {
-    gain_woofer = cmd.substring(7).toFloat();
-    Serial.printf("Gain woofer: %.2f\n", gain_woofer);
-    update_display();
+    float gain;
+    if (parse_float_value(cmd.substring(7), gain) && gain >= 0.0f && gain <= 2.0f)
+    {
+      gain_woofer = gain;
+      Serial.printf("Gain woofer: %.2f\n", gain_woofer);
+      update_display();
+    }
+    else
+    {
+      Serial.println("Gain woofer harus 0.0 - 2.0");
+    }
   }
   else if (cmd.startsWith("gain_t:"))
   {
-    gain_tweeter = cmd.substring(7).toFloat();
-    Serial.printf("Gain tweeter: %.2f\n", gain_tweeter);
-    update_display();
+    float gain;
+    if (parse_float_value(cmd.substring(7), gain) && gain >= 0.0f && gain <= 2.0f)
+    {
+      gain_tweeter = gain;
+      Serial.printf("Gain tweeter: %.2f\n", gain_tweeter);
+      update_display();
+    }
+    else
+    {
+      Serial.println("Gain tweeter harus 0.0 - 2.0");
+    }
   }
   else if (cmd.startsWith("wav_vol:"))
   {
@@ -852,6 +1213,36 @@ void handle_serial()
   {
     save_settings();
   }
+  else if (cmd == "config:on")
+  {
+    if (web_control::config_mode())
+      Serial.println("Sudah di mode setting");
+    else
+      web_control::request_config_mode();
+  }
+  else if (cmd == "config:off")
+  {
+    if (web_control::config_mode())
+      web_control::start_exit_countdown();
+    else
+      Serial.println("Tidak sedang di mode setting");
+  }
+  else if (cmd == "config:cancel")
+  {
+    web_control::cancel_exit_countdown();
+  }
+  else if (cmd == "sample:on" || cmd == "sample:off")
+  {
+    if (!web_control::config_mode())
+      Serial.println("Suara contoh hanya ada di mode setting");
+    else if (!sample_available)
+      Serial.printf("%s tidak ada atau format salah\n", SAMPLE_PATH);
+    else
+    {
+      sample_enabled = cmd == "sample:on";
+      Serial.printf("Suara contoh %s\n", sample_enabled ? "diputar" : "dihentikan");
+    }
+  }
   else if (cmd == "reset")
   {
     // Reset ke default
@@ -860,13 +1251,21 @@ void handle_serial()
     gain_woofer = 1.0f;
     gain_tweeter = 1.0f;
     wav_volume = 0.7f;
+    bass_shelf_freq = dsp::kDefaultBassShelfFrequencyHz;
+    bass_shelf_gain_db = dsp::kDefaultBassShelfGainDb;
+    bass_high_pass_freq = dsp::kDefaultBassHighPassHz;
+    punch_freq = dsp::kDefaultPunchFrequencyHz;
+    punch_gain_db = dsp::kDefaultPunchGainDb;
 
     // Update filter & simpan ke NVS
-    update_crossover(crossover_freq);
+    update_crossover(crossover_freq, bass_shelf_freq, bass_shelf_gain_db);
+    update_punch(bass_high_pass_freq, punch_freq, punch_gain_db);
     save_settings();
+    update_display();
 
     Serial.println("Settings direset ke default!");
-    Serial.println("freq:5000 gain_w:1.0 gain_t:1.0");
+    Serial.printf("freq:5000 gain_w:1.0 gain_t:1.0 bass_hz:%.0f bass_db:%+.1f\n",
+                  bass_shelf_freq, bass_shelf_gain_db);
   }
   else if (cmd == "status")
   {
@@ -875,6 +1274,11 @@ void handle_serial()
     Serial.printf("Crossover   : %.0f Hz\n", crossover_freq);
     Serial.printf("Gain Woofer : %.2f\n", gain_woofer);
     Serial.printf("Gain Tweeter: %.2f\n", gain_tweeter);
+    Serial.printf("Bass Shelf  : %+.1f dB @ %.1f Hz\n",
+                  bass_shelf_gain_db, bass_shelf_freq);
+    Serial.printf("Bass HPF    : %.1f Hz\n", bass_high_pass_freq);
+    Serial.printf("Punch       : %+.1f dB @ %.1f Hz\n",
+                  punch_gain_db, punch_freq);
     Serial.printf("WAV Volume  : %.2f\n", wav_volume);
     Serial.printf("BT Connected: %s\n", a2dp_sink.is_connected() ? "Ya" : "Tidak");
     Serial.println("==========================================");
@@ -884,9 +1288,25 @@ void handle_serial()
     Serial.println("=========== Serial Controller ===========");
     Serial.println("mono:<val>    → mono mix (contoh: on/off)");
     Serial.println("freq:<Hz>     → ubah crossover (100-20000)");
+    Serial.printf("bass_hz:<Hz>  -> frekuensi shelf bass (%.0f-%.0f Hz)\n",
+                  dsp::kMinBassShelfFrequencyHz,
+                  dsp::kMaxBassShelfFrequencyHz);
+    Serial.printf("bass_db:<dB>  -> gain shelf bass (%+.0f to %+.0f dB)\n",
+                  dsp::kMinBassShelfGainDb, dsp::kMaxBassShelfGainDb);
+    Serial.println("bass:<nama>   → preset bass (punch/soft/flat)");
+    Serial.printf("hpf_hz:<Hz>   -> high-pass woofer (%.0f-%.0f Hz)\n",
+                  dsp::kMinBassHighPassHz, dsp::kMaxBassHighPassHz);
+    Serial.printf("punch_hz:<Hz> -> frekuensi punch (%.0f-%.0f Hz)\n",
+                  dsp::kMinPunchFrequencyHz, dsp::kMaxPunchFrequencyHz);
+    Serial.printf("punch_db:<dB> -> gain punch (%.0f to %+.0f dB)\n",
+                  dsp::kMinPunchGainDb, dsp::kMaxPunchGainDb);
     Serial.println("gain_w:<val>  → gain woofer  (contoh: 1.2)");
     Serial.println("gain_t:<val>  → gain tweeter (contoh: 0.8)");
     Serial.println("wav_vol:<val> → volume nada wav, antara 0.0 - 1.0");
+    Serial.println("config:on     → restart ke mode setting (WiFi)");
+    Serial.println("config:off    → kembali ke Bluetooth (hitung mundur 7 detik)");
+    Serial.println("config:cancel → batalkan hitung mundur");
+    Serial.println("sample:on/off → putar/hentikan suara contoh (mode setting)");
     Serial.println("status        → lihat setting saat ini");
     Serial.println("save          → simpan setting saat ini");
     Serial.println("reset         → kembali ke setting default");
@@ -931,20 +1351,60 @@ unsigned long last_ui_update = 0;
 const unsigned long UI_REFRESH_MS = 100;
 
 // ─── SETUP ────────────────────────────────────────────────────
+// btStart() bawaan Arduino memesan memori BLE yang tidak dipakai A2DP. Menyalakan
+// controller lebih dulu membebaskannya, dan WiFi butuh memori itu untuk bisa jalan.
+static bool start_bt_classic_controller()
+{
+  esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+  esp_bt_controller_config_t config = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+  config.mode = ESP_BT_MODE_CLASSIC_BT;
+  return esp_bt_controller_init(&config) == ESP_OK &&
+         esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT) == ESP_OK;
+}
+
+// Mode setting: tanpa Bluetooth, WiFi aktif, suara contoh diputar berulang.
+static void start_config_mode()
+{
+  Serial.println("[Mode] Mode setting (Bluetooth mati)");
+  is_startup = false;
+  // Bluetooth tidak dipakai, jadi seluruh memorinya bisa dipakai WiFi.
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+  web_control::begin(true, handle_command, settings_json, dac_mute);
+
+  File sample = LittleFS.open(SAMPLE_PATH, "r");
+  WavInfo info;
+  sample_available = sample && read_wav_header(sample, info);
+  if (sample)
+    sample.close();
+  if (sample_available)
+  {
+    Serial.printf("Suara contoh: %s, %s, %.1f detik\n", SAMPLE_PATH,
+                  info.channels == 1 ? "mono" : "stereo",
+                  info.data_size / (info.channels * 2.0f * 44100.0f));
+  }
+  else
+  {
+    Serial.printf("Suara contoh %s tidak ada atau format salah\n", SAMPLE_PATH);
+  }
+  xTaskCreate(sample_task, "sample_task", 6144, NULL, 1, NULL);
+  update_display();
+}
+
 void setup()
 {
   Serial.begin(115200);
+  initialize_gpio();
+  const bool config_mode = web_control::boot_into_config_mode();
 
-  // Rotary encoder
-  pinMode(ENC_CLK, INPUT_PULLUP);
-  pinMode(ENC_DT,  INPUT_PULLUP);
-  pinMode(ENC_SW,  INPUT_PULLUP);
-
+#if FEATURE_OLED_ENABLED
   u8g2.begin();
   update_display();
+#endif
 
   load_settings();
-  update_crossover(crossover_freq);
+  if (!update_crossover(crossover_freq, bass_shelf_freq, bass_shelf_gain_db)) {
+    Serial.println("DSP configuration invalid; check stored settings.");
+  }
 
   if (!LittleFS.begin(true))
   {
@@ -956,23 +1416,23 @@ void setup()
   // Init crossover coefficients
   Serial.println("DSP Crossover OK");
 
-  pinMode(BTLED, OUTPUT);
-  pinMode(XSMT_PIN, OUTPUT);
-  pinMode(PAM_M_PIN, OUTPUT);
-  digitalWrite(XSMT_PIN, LOW);
-  digitalWrite(PAM_M_PIN, HIGH);
-
   i2s_driver_install(I2S_NUM_0, &i2s_config_stereo, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pin_config);
 
+  wav_queue = xQueueCreate(4, sizeof(WavRequest));
+  xTaskCreate(wav_task, "wav_task", 8192, NULL, 1, NULL);
+
+  if (config_mode)
+  {
+    start_config_mode();
+    return;
+  }
+  web_control::begin(false, handle_command, settings_json, dac_mute);
+
   // --- EKSEKUSI STARTUP SOUND ---
   Serial.println("Memutar startup sound...");
-  startup_done = false;
   play_wav("/startup-sound-effect.wav");
-  
-  while (!startup_done) {
-    vTaskDelay(pdMS_TO_TICKS(10)); // Tunggu hingga wav_task selesai
-  }
+  wait_for_wav(); // Tunggu hingga wav_task selesai
   Serial.println("Startup sound selesai.");
   is_startup = false;
   update_display();
@@ -988,6 +1448,9 @@ void setup()
   );
   a2dp_sink.set_avrc_metadata_callback(avrc_metadata_callback);
   a2dp_sink.set_avrc_rn_play_pos_callback(avrc_rn_play_pos_callback, 1);
+  if (!start_bt_classic_controller()) {
+    Serial.println("[BT] Gagal menyalakan controller");
+  }
   a2dp_sink.start("Oke Gass ✌️");
 
   Serial.println("Ready! Ketik 'help' untuk daftar perintah.");
@@ -1003,18 +1466,15 @@ void setup()
       Serial.println("[BT] Auto-reconnect berhasil!");
       break;
     }
+    web_control::loop();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 
   if (!was_connected)
   {
     Serial.println("[BT] Tidak ada reconnect → play waiting.wav");
-    startup_done = false;
     play_wav("/waiting.wav");
-    while (!startup_done)
-    {
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    wait_for_wav();
     ever_connected = true;
     update_display();
   }
@@ -1023,9 +1483,20 @@ void setup()
 // ─── LOOP ─────────────────────────────────────────────────────
 void loop()
 {
-  digitalWrite(BTLED, a2dp_sink.is_connected() ? HIGH : LOW);
+  // Mode setting: LED berkedip pelan, cepat saat hitung mundur.
+  // Mode Bluetooth: LED menyala saat tersambung.
+  bool led_on = a2dp_sink.is_connected();
+  if (web_control::config_mode())
+  {
+    const uint32_t period = web_control::exit_countdown_ms() >= 0 ? 100 : 500;
+    led_on = (millis() / period) % 2 == 0;
+  }
+  digitalWrite(BTLED, led_on ? HIGH : LOW);
+  web_control::loop();
   handle_serial();
+#if FEATURE_ROTARY_ENCODER_ENABLED
   handle_encoder();
+#endif
   handle_timeout();
   handle_blink();
 
